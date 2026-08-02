@@ -251,7 +251,16 @@ def _build_model(
         )
 
     # --- Diffusion wrapper ---
-    diffusion = BlockwiseDiffusion(schedule=schedule, token_dim=token_dim).to(device)
+    # The parameterization MUST match training: an epsilon checkpoint loaded as
+    # a v model (or vice versa) produces wrong samples.  Default to "v" (the
+    # training default) only when the checkpoint predates this field.
+    prediction_type: str = config.get(
+        "prediction_type", diff_cfg.get("prediction_type", "v")
+    )
+    diffusion = BlockwiseDiffusion(
+        schedule=schedule, token_dim=token_dim, prediction_type=prediction_type
+    ).to(device)
+    logger.info("Diffusion prediction_type=%s", prediction_type)
 
     # --- Score network ---
     score_net = TrajectoryScoreNet(
@@ -752,17 +761,22 @@ def main(argv: Optional[List[str]] = None) -> None:
     logger.info("Loading D4RL dataset '%s' for initial states …", args.env)
     try:
         dataset = load_d4rl_dataset(args.env)
-        # mu_0 consists of episode starts, not the marginal distribution of
-        # every logged state.  A new episode starts at row zero and after a
-        # terminal/timeout row.
-        boundary = np.asarray(dataset["terminals"], dtype=bool) | np.asarray(
-            dataset.get("timeouts", np.zeros_like(dataset["terminals"])), dtype=bool
-        )
-        start_index = np.concatenate(
-            (np.array([0], dtype=np.int64), np.flatnonzero(boundary) + 1)
-        )
-        start_index = start_index[start_index < len(dataset["observations"])]
-        initial_states_np = dataset["observations"][start_index]
+        # mu_0 is the pool of episode-start observations.  The loader computes
+        # this from the raw episode boundaries (terminals | timeouts) BEFORE the
+        # qlearning conversion, since qlearning_dataset drops timeouts and would
+        # otherwise collapse mu_0 to a single state.
+        if "episode_start_observations" in dataset:
+            initial_states_np = dataset["episode_start_observations"]
+        else:  # pragma: no cover - legacy datasets without the explicit pool
+            boundary = np.asarray(dataset["terminals"], dtype=bool) | np.asarray(
+                dataset.get("timeouts", np.zeros_like(dataset["terminals"])),
+                dtype=bool,
+            )
+            start_index = np.concatenate(
+                (np.array([0], dtype=np.int64), np.flatnonzero(boundary) + 1)
+            )
+            start_index = start_index[start_index < len(dataset["observations"])]
+            initial_states_np = dataset["observations"][start_index]
         # Normalise observations to match training distribution.
         initial_states_np = normalizer.normalize_obs(initial_states_np)
     except ImportError:

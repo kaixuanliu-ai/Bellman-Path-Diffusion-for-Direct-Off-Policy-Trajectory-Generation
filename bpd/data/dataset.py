@@ -92,13 +92,37 @@ def load_d4rl_dataset(env_name: str) -> Dict[str, np.ndarray]:
         ) from exc
 
     env = gym.make(env_name)
-    # Prefer d4rl.qlearning_dataset: it constructs ``next_observations`` (which
-    # the raw env.get_dataset() does not always provide) and drops terminal
+
+    # Read the raw dataset once.  It retains ``terminals`` and ``timeouts`` in
+    # the original episode order, which we need to recover the initial-state
+    # distribution mu_0 (episode starts).  qlearning_dataset() then drops
+    # terminal transitions and does NOT preserve timeouts, so mu_0 cannot be
+    # recovered from its output alone.
+    raw_full: Dict[str, np.ndarray] = env.get_dataset()
+
+    # Compute episode-start observations from the raw ordering: a new episode
+    # starts at row 0 and immediately after every terminal or timeout row.
+    n_raw = raw_full["observations"].shape[0]
+    raw_terminals = np.asarray(
+        raw_full.get("terminals", np.zeros(n_raw, dtype=bool)), dtype=bool
+    ).reshape(n_raw)
+    raw_timeouts = np.asarray(
+        raw_full.get("timeouts", np.zeros(n_raw, dtype=bool)), dtype=bool
+    ).reshape(n_raw)
+    raw_boundary = raw_terminals | raw_timeouts
+    start_idx = np.concatenate(
+        (np.array([0], dtype=np.int64), np.flatnonzero(raw_boundary) + 1)
+    )
+    start_idx = start_idx[start_idx < n_raw]
+    episode_start_obs = raw_full["observations"][start_idx].astype(np.float32)
+
+    # Prefer d4rl.qlearning_dataset for the transition tuples: it constructs
+    # ``next_observations`` (which the raw dataset may lack) and drops terminal
     # transitions with ill-defined successors, matching the offline-RL contract.
     if hasattr(d4rl, "qlearning_dataset"):
-        raw: Dict[str, np.ndarray] = d4rl.qlearning_dataset(env)
+        raw: Dict[str, np.ndarray] = d4rl.qlearning_dataset(env, dataset=raw_full)
     else:  # pragma: no cover - fallback for nonstandard d4rl builds
-        raw = env.get_dataset()
+        raw = raw_full
 
     # Validate required keys
     required = {"observations", "actions", "rewards", "next_observations", "terminals"}
@@ -108,11 +132,13 @@ def load_d4rl_dataset(env_name: str) -> Dict[str, np.ndarray]:
 
     N = raw["observations"].shape[0]
     logger.info(
-        "Loaded D4RL dataset '%s': %d transitions, obs_dim=%d, act_dim=%d",
+        "Loaded D4RL dataset '%s': %d transitions, obs_dim=%d, act_dim=%d, "
+        "%d episode starts (mu_0)",
         env_name,
         N,
         raw["observations"].shape[1],
         raw["actions"].shape[1],
+        episode_start_obs.shape[0],
     )
 
     dataset: Dict[str, np.ndarray] = {
@@ -121,11 +147,14 @@ def load_d4rl_dataset(env_name: str) -> Dict[str, np.ndarray]:
         "rewards": raw["rewards"].astype(np.float32).reshape(N),
         "next_observations": raw["next_observations"].astype(np.float32),
         "terminals": raw["terminals"].astype(bool).reshape(N),
+        # Explicit mu_0 pool, computed from the raw episode boundaries above.
+        "episode_start_observations": episode_start_obs,
     }
 
-    # timeouts are present in most D4RL datasets but not all
+    # timeouts of the returned (qlearning) transitions are usually absent; keep
+    # a field for API symmetry.  mu_0 must use ``episode_start_observations``.
     if "timeouts" in raw:
-        dataset["timeouts"] = raw["timeouts"].astype(bool).reshape(N)
+        dataset["timeouts"] = np.asarray(raw["timeouts"], dtype=bool).reshape(N)
     else:
         dataset["timeouts"] = np.zeros(N, dtype=bool)
 

@@ -1560,6 +1560,64 @@ teacher's noise prediction at the same discrete time index. The resulting loss
 is the trajectory counterpart of the TD$^2$-DD implementation in
 \citet{farebrother2025tdflow}.
 
+\subsection{Velocity Parameterization at the Exact Source}
+\label{app:vpred}
+
+The boundary condition $\alpha_T=0,\sigma_T=1$ in \cref{eq:boundary-schedule}
+makes the source marginal exactly $\Normal(0,I)$, which is required for the
+common-source statement in \cref{thm:path-mixture}. Under this exact boundary
+the noise parameterization is numerically singular: recovering the clean tensor
+from a predicted noise,
+\begin{equation}
+\widehat{\Phi_h(W)}
+=
+\frac{z_t-\sqrt{1-\bar\alpha_t}\,\hat\epsilon}{\sqrt{\bar\alpha_t}},
+\end{equation}
+divides by $\sqrt{\bar\alpha_T}=0$ at the terminal step, so any error in
+$\hat\epsilon$ is amplified without bound. We therefore parameterize the network
+by the velocity
+\begin{equation}
+v_t
+:=
+\sqrt{\bar\alpha_t}\,\epsilon
+-
+\sqrt{1-\bar\alpha_t}\,\Phi_h(W),
+\end{equation}
+whose clean-tensor recovery,
+\begin{equation}
+\widehat{\Phi_h(W)}
+=
+\sqrt{\bar\alpha_t}\,z_t
+-
+\sqrt{1-\bar\alpha_t}\,v_t,
+\end{equation}
+stays finite at the source, where it reduces to
+$\widehat{\Phi_h(W)}=-v_T$. The velocity, the noise, and the score are related
+by the invertible affine maps
+\begin{equation}
+\epsilon
+=
+\sqrt{\bar\alpha_t}\,v_t+\sqrt{1-\bar\alpha_t}\,z_t,
+\qquad
+\nabla_{z_t}\log q_t(z_t\mid W)
+=
+-\frac{\epsilon}{\sqrt{1-\bar\alpha_t}},
+\end{equation}
+so the velocity network encodes exactly the same score field
+$\nabla_z\log m_{h,t}^{\targetpi}$ as
+\cref{thm:population-score-backup}; the Bellman decomposition
+\cref{eq:noise-bellman} and all recovery guarantees are unchanged. The branch
+targets are the images of the $\epsilon$-targets under this map: on the stopping
+branch the target is $v_t$ of the padded stop path
+$\stoptraj_h(y)$; on the continuation branch the current-token target is the
+analytic $v_t$ of the known transition $y$, and the suffix target is the frozen
+teacher's velocity prediction at the same discrete index, again with the
+stop-gradient of \cref{eq:continuation-score-target} and without any
+$\gamma$ prefactor. This is the parameterization used by the reference
+implementation, following the zero-terminal-SNR analysis of
+\citet{lin2024commondiffusion} and the velocity objective of
+\citet{salimans2022progressive}.
+
 \section{Practical Variant with EMA Targets}
 \label{app:ema}
 
@@ -1596,6 +1654,17 @@ Michael Janner, Igor Mordatch, and Sergey Levine.
 \newblock Gamma-Models: Generative Temporal Difference Learning for
 Infinite-Horizon Prediction.
 \newblock In \emph{Advances in Neural Information Processing Systems}, 2020.
+
+\bibitem[Lin et al.(2024)]{lin2024commondiffusion}
+Shanchuan Lin, Bingchen Liu, Jiashi Li, and Xiao Yang.
+\newblock Common Diffusion Noise Schedules and Sample Steps are Flawed.
+\newblock In \emph{IEEE/CVF Winter Conference on Applications of Computer
+Vision (WACV)}, 2024.
+
+\bibitem[Salimans and Ho(2022)]{salimans2022progressive}
+Tim Salimans and Jonathan Ho.
+\newblock Progressive Distillation for Fast Sampling of Diffusion Models.
+\newblock In \emph{International Conference on Learning Representations}, 2022.
 
 \bibitem[Song et al.(2021)]{song2021sde}
 Yang Song, Jascha Sohl-Dickstein, Diederik P. Kingma, Abhishek Kumar,

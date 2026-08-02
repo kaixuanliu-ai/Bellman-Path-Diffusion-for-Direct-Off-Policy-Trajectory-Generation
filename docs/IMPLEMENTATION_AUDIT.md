@@ -83,14 +83,29 @@ directory. No reference repository is vendored into this project.
   value equal to the argparse default is no longer overridden by YAML).
   `corollary1_error_bound` now documents its argument as the return-seminorm
   (G-seminorm) stage error epsilon_h^G (Eq. 66), not a score-matching residual.
+- Initial-state distribution mu_0: the D4RL loader computes episode-start
+  observations from the raw episode boundaries (`terminals | timeouts`) BEFORE
+  the qlearning conversion and returns them as `episode_start_observations`.
+  qlearning_dataset drops timeouts, so deriving mu_0 from its output would
+  collapse the start pool to a single state on time-limit-terminated
+  locomotion data; the evaluator now consumes the explicit pool.
+- The diffusion parameterization is self-describing: `prediction_type` is a CLI
+  flag, is saved in the training config/checkpoint, and is read back at
+  evaluation, so an epsilon checkpoint is never silently loaded as a v model.
+- v-prediction is now documented in the paper (Appendix, "Velocity
+  Parameterization at the Exact Source"): the v<->epsilon<->score transforms,
+  the branch v-targets, the frozen-teacher recursion in the v basis, and the
+  exact-source rationale, with the Lin et al. 2024 and Salimans & Ho 2022
+  citations added to the bibliography.
 - Coverage of every evaluation-policy state-action pair cannot be established
   from software alone. Training/evaluation must report a coverage diagnostic
   for each dataset-policy pair.
 - Deferred (not yet implemented, do not affect the core recursion): a
   target-policy checkpoint loader in the CLI (the API already accepts any
-  policy callable), a dedicated absorbing-state flag, an executable coverage
-  diagnostic, and true stage/step training resume. `gym>=0.26` is declared but
-  the rollout code uses the older `reset/step/env.seed` API.
+  policy callable; the CLI exposes only `dataset` and `random`), a dedicated
+  absorbing-state conditioning flag, an executable coverage diagnostic, and
+  true stage/step training resume. `gym>=0.26` is declared but the rollout code
+  uses the older `reset/step/env.seed` API.
 - The included tests verify equations, shapes, gradients, replay keys, the
   v-prediction source stability, and a two-stage CPU smoke run. They are not
   benchmark results. A paper claim of empirical OPE accuracy requires full

@@ -233,6 +233,16 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Noise schedule for the forward diffusion process.",
     )
     p.add_argument(
+        "--prediction_type",
+        type=str,
+        default="v",
+        choices=["v", "epsilon"],
+        help=(
+            "Network output parameterization. 'v' (default) keeps x0 recovery "
+            "finite at the exact source alpha_T=0; 'epsilon' predicts noise."
+        ),
+    )
+    p.add_argument(
         "--model_dim",
         type=int,
         default=256,
@@ -635,12 +645,17 @@ def train(args: argparse.Namespace) -> None:
     else:
         schedule = DDPMSchedule.make_linear(T=args.diffusion_steps)
 
-    diffusion = BlockwiseDiffusion(schedule=schedule, token_dim=d_tok).to(device)
+    diffusion = BlockwiseDiffusion(
+        schedule=schedule,
+        token_dim=d_tok,
+        prediction_type=args.prediction_type,
+    ).to(device)
 
     logger.info(
-        "DDPMSchedule: T=%d, beta_schedule=%s",
+        "DDPMSchedule: T=%d, beta_schedule=%s, prediction_type=%s",
         args.diffusion_steps,
         args.beta_schedule,
+        args.prediction_type,
     )
 
     # ------------------------------------------------------------------
@@ -712,6 +727,7 @@ def train(args: argparse.Namespace) -> None:
         "lr": args.lr,
         "diffusion_steps": args.diffusion_steps,
         "beta_schedule": args.beta_schedule,
+        "prediction_type": args.prediction_type,
         "model_dim": args.model_dim,
         "num_heads": args.num_heads,
         "num_layers": args.num_layers,
