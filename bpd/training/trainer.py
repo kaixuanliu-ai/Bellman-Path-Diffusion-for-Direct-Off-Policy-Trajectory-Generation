@@ -113,6 +113,12 @@ class BellmanPathDiffusionTrainer:
         device = torch.device(device)
         self.score_net.to(device).train()
         self.diffusion.to(device)
+        # The EMA shadow (and every frozen teacher) must live on the compute
+        # device: the shadow is the continuation-branch teacher and is queried
+        # on device tensors during replay refresh and training.
+        self.ema.get_model().to(device)
+        for teacher in self._teachers.values():
+            teacher.to(device)
         # Keep the transition dataset resident on the compute device so batch
         # sampling is an on-device gather (no per-step host->device copies).
         if self.data_on_device and dataset.states.device != device:
@@ -301,7 +307,8 @@ class BellmanPathDiffusionTrainer:
         return call
 
     def _freeze_stage(self, h: int) -> None:
-        teacher = copy.deepcopy(self.ema.get_model())
+        device = next(self.score_net.parameters()).device
+        teacher = copy.deepcopy(self.ema.get_model()).to(device)
         teacher.eval().requires_grad_(False)
         self._teachers[h] = teacher
 
