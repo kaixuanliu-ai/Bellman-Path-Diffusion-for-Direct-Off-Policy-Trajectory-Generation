@@ -101,6 +101,7 @@ class BellmanDiffusionLoss(nn.Module):
         *,
         next_action: Tensor,
         replay_buffer: Optional[SuffixReplayBuffer] = None,
+        cached_suffix: Optional[Tensor] = None,
     ) -> Tensor:
         targets = self.build_targets(
             teacher_noise_fn=teacher_noise_fn,
@@ -108,6 +109,7 @@ class BellmanDiffusionLoss(nn.Module):
             h=h,
             next_action=next_action,
             replay_buffer=replay_buffer,
+            cached_suffix=cached_suffix,
         )
         prediction = noise_net(
             targets.z_t,
@@ -137,6 +139,7 @@ class BellmanDiffusionLoss(nn.Module):
         *,
         next_action: Tensor,
         replay_buffer: Optional[SuffixReplayBuffer] = None,
+        cached_suffix: Optional[Tensor] = None,
         timesteps: Optional[Tensor] = None,
         continuation: Optional[Tensor] = None,
         noise: Optional[Tensor] = None,
@@ -146,6 +149,12 @@ class BellmanDiffusionLoss(nn.Module):
         Optional ``timesteps``, ``continuation``, and ``noise`` arguments make
         the mathematical target directly testable without changing production
         sampling behavior.
+
+        ``cached_suffix`` (shape ``(batch_size, h-1, token_dim)``) supplies clean
+        teacher suffixes for the whole batch, already aligned with the sampled
+        transitions.  When given, the continuation branch uses them directly and
+        skips the per-item replay-buffer lookup — the fast path for amortized
+        replay (Proposition 2).  It must be sampled from exactly this batch's x'.
         """
         if h < 1:
             raise ValueError(f"h must be positive, got {h}")
@@ -207,12 +216,19 @@ class BellmanDiffusionLoss(nn.Module):
                 raise ValueError("teacher_noise_fn is required for h > 1 continuation")
             cont_indices = continuation.nonzero(as_tuple=False).squeeze(-1)
             cont_x_prime = x_prime[cont_indices]
-            clean_suffix = self._clean_suffixes(
-                teacher_noise_fn,
-                cont_x_prime,
-                h - 1,
-                replay_buffer,
-            )
+            if cached_suffix is not None:
+                # Fast amortized path: suffixes are already aligned with the
+                # batch; just select the continuation rows (no buffer lookup).
+                clean_suffix = cached_suffix[cont_indices].to(
+                    device=state.device, dtype=state.dtype
+                )
+            else:
+                clean_suffix = self._clean_suffixes(
+                    teacher_noise_fn,
+                    cont_x_prime,
+                    h - 1,
+                    replay_buffer,
+                )
             cont = self.continue_branch.build(
                 y[cont_indices],
                 cont_x_prime,
