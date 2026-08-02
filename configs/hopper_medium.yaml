@@ -1,0 +1,6 @@
+defaults:
+  - base
+env: hopper-medium-v2
+obs_dim: 11
+act_dim: 3
+token_dim: 15  # 1 reward + 11 obs + 3 act

@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "bellman-path-diffusion"
+version = "0.1.0"
+description = "Bellman Path Diffusion for Direct Off-Policy Trajectory Generation"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "torch>=2.0.0",
+    "numpy>=1.23",
+    "einops>=0.6.1",
+    "pyyaml>=6.0",
+    "tqdm>=4.65",
+    "scipy>=1.9",
+]
+
+[project.optional-dependencies]
+d4rl = ["d4rl", "gym>=0.26.0"]
+dev = ["pytest>=7.0", "black", "isort"]
+wandb = ["wandb>=0.15"]
+
+[tool.setuptools.packages.find]
+include = ["bpd*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

@@ -1,0 +1,55 @@
+# Python bytecode
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual environments
+.env
+.venv/
+venv/
+env/
+
+# Distribution / packaging
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Experiment outputs (large files)
+results/
+logs/
+wandb/
+
+# Model checkpoints (typically too large for git)
+*.pt
+*.pth
+*.ckpt
+
+# Datasets
+data/
+
+# Editor / OS artifacts
+.DS_Store
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Tracked explicitly:
+# configs/
+# scripts/
+# bpd/
+# tests/
+# pyproject.toml
+# requirements.txt
+# README.md
