@@ -32,7 +32,6 @@ from __future__ import annotations
 import argparse
 import json
 import logging
-import os
 import sys
 import time
 from pathlib import Path
@@ -49,12 +48,11 @@ _PROJECT_ROOT = _SCRIPT_DIR.parent
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
-from bpd.data.dataset import Normalizer, load_d4rl_dataset
-from bpd.evaluation.ope import OPEEvaluator
-from bpd.models.diffusion import BlockwiseDiffusion, DDPMSchedule
-from bpd.models.score_net import TrajectoryScoreNet
-from bpd.training.ema import EMA
-from bpd.utils.serialization import load_checkpoint
+from bpd.data.dataset import Normalizer, load_d4rl_dataset  # noqa: E402
+from bpd.evaluation.ope import OPEEvaluator  # noqa: E402
+from bpd.models.diffusion import BlockwiseDiffusion, DDPMSchedule  # noqa: E402
+from bpd.models.score_net import TrajectoryScoreNet  # noqa: E402
+from bpd.utils.serialization import load_checkpoint  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -238,8 +236,10 @@ def _build_model(
     diff_cfg: Dict[str, Any] = config.get("diffusion", {})
 
     # --- Noise schedule ---
-    T: int = int(diff_cfg.get("num_steps", 1000))
-    beta_schedule: str = diff_cfg.get("beta_schedule", "cosine")
+    T: int = int(config.get("diffusion_steps", diff_cfg.get("num_steps", 1000)))
+    beta_schedule: str = config.get(
+        "beta_schedule", diff_cfg.get("beta_schedule", "cosine")
+    )
 
     if beta_schedule == "cosine":
         schedule = DDPMSchedule.make_cosine(T=T)
@@ -247,8 +247,7 @@ def _build_model(
         schedule = DDPMSchedule.make_linear(T=T)
     else:
         raise ValueError(
-            f"Unknown beta_schedule '{beta_schedule}'. "
-            "Choose 'cosine' or 'linear'."
+            f"Unknown beta_schedule '{beta_schedule}'. Choose 'cosine' or 'linear'."
         )
 
     # --- Diffusion wrapper ---
@@ -259,11 +258,11 @@ def _build_model(
         obs_dim=obs_dim,
         act_dim=act_dim,
         token_dim=token_dim,
-        model_dim=int(model_cfg.get("model_dim", 256)),
-        num_heads=int(model_cfg.get("num_heads", 8)),
-        num_layers=int(model_cfg.get("num_layers", 6)),
+        model_dim=int(config.get("model_dim", model_cfg.get("model_dim", 256))),
+        num_heads=int(config.get("num_heads", model_cfg.get("num_heads", 8))),
+        num_layers=int(config.get("num_layers", model_cfg.get("num_layers", 6))),
         max_horizon=max_horizon,
-        dropout=float(model_cfg.get("dropout", 0.0)),
+        dropout=float(config.get("dropout", model_cfg.get("dropout", 0.0))),
     ).to(device)
 
     n_params = score_net.num_parameters()
@@ -273,7 +272,7 @@ def _build_model(
         obs_dim,
         act_dim,
         token_dim,
-        model_cfg.get("model_dim", 256),
+        config.get("model_dim", model_cfg.get("model_dim", 256)),
         max_horizon,
         f"{n_params:,}",
     )
@@ -288,45 +287,45 @@ def _load_model_weights(
 ) -> TrajectoryScoreNet:
     """Load model weights from *ckpt* into *score_net*.
 
-    Tries the following keys in order:
-      1. ``"ema_model"``  – EMA shadow weights (preferred for inference).
-      2. ``"model"``      – raw model weights.
+    The current checkpoint schema stores the inference weights under
+    ``ema["shadow_state_dict"]`` and the online weights under ``score_net``.
+    Legacy ``ema_model``/``model`` keys remain readable.
 
     The loaded state dict may have been saved from a ``DataParallel`` wrapper
     (keys prefixed with ``"module."``) or from an EMA helper that stores a
     plain ``nn.Module``; both cases are handled.
     """
-    for key in ("ema_model", "model"):
-        if key not in ckpt:
-            continue
+    candidates = []
+    if isinstance(ckpt.get("ema"), dict) and "shadow_state_dict" in ckpt["ema"]:
+        candidates.append(("ema.shadow_state_dict", ckpt["ema"]["shadow_state_dict"]))
+    for key in ("score_net", "ema_model", "model"):
+        if key in ckpt:
+            candidates.append((key, ckpt[key]))
 
-        raw = ckpt[key]
-
+    for key, raw in candidates:
         # The EMA helper may store the full EMA object or just the state_dict.
         if isinstance(raw, dict):
             state_dict = raw
         elif hasattr(raw, "state_dict"):
             state_dict = raw.state_dict()
         else:
-            logger.warning("Unexpected type for ckpt['%s']: %s — skipping.", key, type(raw))
+            logger.warning(
+                "Unexpected type for ckpt['%s']: %s — skipping.", key, type(raw)
+            )
             continue
 
         # Strip DataParallel prefix if present.
         if any(k.startswith("module.") for k in state_dict):
             state_dict = {k.removeprefix("module."): v for k, v in state_dict.items()}
 
-        missing, unexpected = score_net.load_state_dict(state_dict, strict=False)
-        if missing:
-            logger.warning("Missing keys in checkpoint (%s): %s", key, missing[:10])
-        if unexpected:
-            logger.warning("Unexpected keys in checkpoint (%s): %s", key, unexpected[:10])
+        score_net.load_state_dict(state_dict, strict=True)
 
         logger.info("Loaded model weights from ckpt['%s'].", key)
         score_net = score_net.to(device).eval()
         return score_net
 
     raise KeyError(
-        "Checkpoint does not contain 'ema_model' or 'model' key. "
+        "Checkpoint does not contain BPD model weights. "
         f"Available keys: {list(ckpt.keys())}"
     )
 
@@ -351,7 +350,13 @@ def _build_normalizer(
         normalizer = Normalizer.__new__(Normalizer)
         # Restore from saved state (dict of numpy arrays / Python scalars).
         for attr, value in norm_state.items():
-            setattr(normalizer, attr, np.array(value, dtype=np.float32) if not isinstance(value, float) else float(value))
+            setattr(
+                normalizer,
+                attr,
+                np.array(value, dtype=np.float32)
+                if not isinstance(value, float)
+                else float(value),
+            )
         # Restore eps if present, default otherwise.
         if not hasattr(normalizer, "eps"):
             normalizer.eps = 1e-8
@@ -368,72 +373,65 @@ def _build_normalizer(
 
 
 # ---------------------------------------------------------------------------
-# Evaluation policy (identity / random — placeholder for a real policy)
+# Evaluation-policy reconstruction
 # ---------------------------------------------------------------------------
 
 
 def _build_eval_policy(
-    ckpt: Dict[str, Any],
+    policy_type: str,
+    dataset: Dict[str, np.ndarray],
+    normalizer: Normalizer,
     obs_dim: int,
     act_dim: int,
     device: torch.device,
 ):
     """Return a callable (states: Tensor) -> Tensor for the evaluation policy.
 
-    If the checkpoint contains a 'policy' key with a state_dict the policy
-    network is loaded from there.  Otherwise a zero-action policy is used as a
-    stand-in (suitable for unit tests; production use should embed a real
-    policy in the checkpoint).
-
-    The returned callable expects a CPU or GPU tensor and returns an action
-    tensor on the same device.
+    Rebuild the exact policy family selected by ``scripts/train.py``.  Missing
+    or unknown policy metadata is an error; evaluation never silently changes
+    the target policy.
     """
-    if "policy" in ckpt:
-        # Lazy import to avoid a hard dependency on any policy library.
-        try:
-            from bpd.models.score_net import TrajectoryScoreNet  # noqa: F401 (already imported)
-            policy_sd = ckpt["policy"]
-            if hasattr(policy_sd, "state_dict"):
-                policy_sd = policy_sd.state_dict()
+    if policy_type == "random":
 
-            # Build a minimal linear policy (obs → act) as a placeholder if
-            # the shape can be inferred.  Real checkpoints should supply their
-            # own policy class.
-            policy_net = torch.nn.Linear(obs_dim, act_dim).to(device)
-            try:
-                policy_net.load_state_dict(policy_sd, strict=False)
-                logger.info("Loaded linear policy from checkpoint.")
-            except Exception:
-                logger.warning(
-                    "Could not load policy state_dict into a Linear layer; "
-                    "falling back to zero-action policy."
-                )
-                policy_net = None
-        except Exception as exc:
-            logger.warning("Failed to build policy from checkpoint: %s", exc)
-            policy_net = None
-    else:
-        policy_net = None
+        def random_policy(states: torch.Tensor) -> torch.Tensor:
+            return (
+                torch.rand(states.shape[0], act_dim, device=states.device) * 2.0 - 1.0
+            )
 
-    if policy_net is not None:
-        policy_net.eval()
+        return random_policy
 
-        def _policy_fn(states: torch.Tensor) -> torch.Tensor:
-            with torch.no_grad():
-                return policy_net(states.to(device))
-
-    else:
-        logger.warning(
-            "No evaluation policy found in checkpoint.  "
-            "Using zero-action policy — OPE estimates will not be meaningful "
-            "for a non-trivial environment."
+    if policy_type == "dataset":
+        normalized_states = torch.tensor(
+            normalizer.normalize_obs(dataset["observations"]),
+            dtype=torch.float32,
+            device=device,
+        )
+        normalized_actions = torch.tensor(
+            normalizer.normalize_act(dataset["actions"]),
+            dtype=torch.float32,
+            device=device,
         )
 
-        def _policy_fn(states: torch.Tensor) -> torch.Tensor:  # type: ignore[misc]
-            B = states.shape[0]
-            return torch.zeros(B, act_dim, device=states.device, dtype=torch.float32)
+        def dataset_policy(states: torch.Tensor) -> torch.Tensor:
+            states = states.to(device)
+            best_distance = torch.full((states.shape[0],), float("inf"), device=device)
+            nearest = torch.zeros(states.shape[0], dtype=torch.long, device=device)
+            for start in range(0, normalized_states.shape[0], 65_536):
+                distance = torch.cdist(
+                    states, normalized_states[start : start + 65_536]
+                ).square()
+                chunk_best, chunk_index = distance.min(dim=1)
+                improve = chunk_best < best_distance
+                best_distance[improve] = chunk_best[improve]
+                nearest[improve] = start + chunk_index[improve]
+            return normalized_actions[nearest]
 
-    return _policy_fn
+        return dataset_policy
+
+    raise ValueError(
+        f"checkpoint has unsupported eval_policy={policy_type!r}; "
+        "evaluation policy must match training"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -560,12 +558,10 @@ def _mc_ground_truth(
         ``"n_episodes"`` – int.
     """
     try:
-        import gym  # type: ignore[import]
         import d4rl  # type: ignore[import]  # noqa: F401
+        import gym  # type: ignore[import]
     except ImportError as exc:
-        logger.warning(
-            "Cannot run MC ground truth: gym/d4rl not available (%s).", exc
-        )
+        logger.warning("Cannot run MC ground truth: gym/d4rl not available (%s).", exc)
         return {}
 
     env = gym.make(env_name)
@@ -582,7 +578,9 @@ def _mc_ground_truth(
         while not done:
             # Normalise observation before feeding to the policy.
             obs_norm = normalizer.normalize_obs(obs.reshape(1, -1)).reshape(-1)
-            obs_t = torch.tensor(obs_norm, dtype=torch.float32, device=device).unsqueeze(0)
+            obs_t = torch.tensor(
+                obs_norm, dtype=torch.float32, device=device
+            ).unsqueeze(0)
 
             with torch.no_grad():
                 act_norm = eval_policy_fn(obs_t).squeeze(0).cpu().numpy()
@@ -591,7 +589,7 @@ def _mc_ground_truth(
             act = normalizer.unnormalize_act(act_norm.reshape(1, -1)).reshape(-1)
 
             obs, reward, done, info = env.step(act)
-            ep_return += (gamma ** t_step) * reward
+            ep_return += (gamma**t_step) * reward
             t_step += 1
 
         episode_returns.append(ep_return)
@@ -636,8 +634,11 @@ def _report_length_distribution(length_dist: Dict[str, Any]) -> None:
     print("Length distribution  (Eq. 14):")
     print(header)
     print("-" * len(header))
-    for l in range(1, H + 1):
-        print(f"{l:>8}  {empirical[l-1]:>14.6f}  {theoretical[l-1]:>15.6f}")
+    for length in range(1, H + 1):
+        print(
+            f"{length:>8}  {empirical[length - 1]:>14.6f}  "
+            f"{theoretical[length - 1]:>15.6f}"
+        )
     print("=" * len(header))
     print(f"  Mean length: empirical={mean_emp:.3f}  theoretical={mean_theo:.3f}")
     print(f"  KL(empirical || theoretical) = {kl:.6f} nats")
@@ -748,26 +749,38 @@ def main(argv: Optional[List[str]] = None) -> None:
     logger.info("Loading D4RL dataset '%s' for initial states …", args.env)
     try:
         dataset = load_d4rl_dataset(args.env)
-        initial_states_np = dataset["observations"]  # (N, obs_dim)
+        # mu_0 consists of episode starts, not the marginal distribution of
+        # every logged state.  A new episode starts at row zero and after a
+        # terminal/timeout row.
+        boundary = np.asarray(dataset["terminals"], dtype=bool) | np.asarray(
+            dataset.get("timeouts", np.zeros_like(dataset["terminals"])), dtype=bool
+        )
+        start_index = np.concatenate(
+            (np.array([0], dtype=np.int64), np.flatnonzero(boundary) + 1)
+        )
+        start_index = start_index[start_index < len(dataset["observations"])]
+        initial_states_np = dataset["observations"][start_index]
         # Normalise observations to match training distribution.
         initial_states_np = normalizer.normalize_obs(initial_states_np)
     except ImportError:
-        logger.warning(
-            "D4RL not available.  Using random Gaussian initial states.  "
-            "Install d4rl for meaningful evaluation."
+        raise RuntimeError(
+            "D4RL is required to recover mu_0 and the configured evaluation policy"
         )
-        rng = np.random.default_rng(args.seed)
-        initial_states_np = rng.standard_normal((1000, obs_dim)).astype(np.float32)
 
-    initial_states = torch.tensor(
-        initial_states_np, dtype=torch.float32, device=device
-    )
+    initial_states = torch.tensor(initial_states_np, dtype=torch.float32, device=device)
     logger.info("Initial state pool size: %d", initial_states.shape[0])
 
     # ------------------------------------------------------------------
     # 5. Build evaluation policy
     # ------------------------------------------------------------------
-    eval_policy_fn = _build_eval_policy(ckpt, obs_dim, act_dim, device)
+    eval_policy_fn = _build_eval_policy(
+        str(config.get("eval_policy", "")),
+        dataset,
+        normalizer,
+        obs_dim,
+        act_dim,
+        device,
+    )
 
     # ------------------------------------------------------------------
     # 6. Build OPEEvaluator
@@ -777,9 +790,7 @@ def main(argv: Optional[List[str]] = None) -> None:
         "obs_dim": obs_dim,
         "act_dim": act_dim,
         "gamma": gamma,
-        "pad_threshold": float(config.get("pad_threshold", 0.5)),
         "norm_threshold": float(config.get("norm_threshold", 0.3)),
-        "clip_denoised": bool(config.get("clip_denoised", True)),
     }
 
     evaluator = OPEEvaluator(
@@ -825,7 +836,7 @@ def main(argv: Optional[List[str]] = None) -> None:
     )
 
     print("\n" + "=" * 60)
-    print(f"  OPE Estimate (Eq. 59):")
+    print("  OPE Estimate (Eq. 59):")
     print(f"    J_hat_H(pi) = {ope_estimate:.4f}")
     print(f"    95%% CI      = [{ci_lo:.4f}, {ci_hi:.4f}]")
     print(f"    n_trajectories = {args.n_trajectories}")
@@ -910,7 +921,9 @@ def main(argv: Optional[List[str]] = None) -> None:
     if mc_results:
         results["ground_truth_mc"] = mc_results
         if "mc_mean" in mc_results:
-            results["ope"]["abs_error_vs_mc"] = abs(ope_estimate - mc_results["mc_mean"])
+            results["ope"]["abs_error_vs_mc"] = abs(
+                ope_estimate - mc_results["mc_mean"]
+            )
 
     dest = _save_results(results, args.output_dir)
     logger.info("Evaluation complete.  Results saved to: %s", dest)

@@ -92,17 +92,11 @@ class EMA:
         update_after_step: int = 100,
     ) -> None:
         if not (0.0 < decay < 1.0):
-            raise ValueError(
-                f"decay must be in the open interval (0, 1); got {decay}"
-            )
+            raise ValueError(f"decay must be in the open interval (0, 1); got {decay}")
         if update_every < 1:
-            raise ValueError(
-                f"update_every must be >= 1; got {update_every}"
-            )
+            raise ValueError(f"update_every must be >= 1; got {update_every}")
         if update_after_step < 0:
-            raise ValueError(
-                f"update_after_step must be >= 0; got {update_after_step}"
-            )
+            raise ValueError(f"update_after_step must be >= 0; got {update_after_step}")
 
         self.decay = decay
         self.update_every = update_every
@@ -146,8 +140,12 @@ class EMA:
         with self._lock:
             self._step += 1
 
-            # Warm-up: do nothing until enough steps have elapsed.
+            # During warm-up keep the shadow synchronized with the online
+            # model.  This is the reset-to-online behavior used by Diffuser's
+            # trainer and prevents a short horizon stage from freezing the
+            # random initialization as its teacher.
             if step < self.update_after_step:
+                self.copy_params_from_model_to_ema(model)
                 return
 
             # Throttle: only update every ``update_every`` internal steps.
@@ -318,6 +316,7 @@ class EMA:
                 current_val = getattr(self, key)
                 if saved_val is not None and saved_val != current_val:
                     import warnings
+
                     warnings.warn(
                         f"EMA.load_state_dict: checkpoint has {key}={saved_val!r} "
                         f"but current instance has {key}={current_val!r}. "

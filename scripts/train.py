@@ -25,18 +25,15 @@ With a YAML config (individual flags override config values):
 eval_policy choices
 -------------------
 dataset  : Use the dataset action at s' as a proxy for pi_e.
-           Implements behavior-cloning style evaluation — useful for
-           debugging without a real policy.
+           Implements a deterministic nearest-neighbour policy evaluated at
+           each queried state — useful for debugging without a real policy.
 random   : Sample a uniformly random action in [-1, 1]^{act_dim}.
-argmax   : Placeholder for a learned greedy policy.  Falls back to
-           random until a real policy is plugged in.
 """
 
 from __future__ import annotations
 
 import argparse
 import logging
-import os
 import random
 import sys
 from pathlib import Path
@@ -44,7 +41,6 @@ from typing import Any, Callable, Dict, Optional
 
 import numpy as np
 import torch
-import torch.nn as nn
 
 # ---------------------------------------------------------------------------
 # Project root on sys.path (allows running without pip install)
@@ -61,6 +57,7 @@ if str(_PROJECT_ROOT) not in sys.path:
 # ---------------------------------------------------------------------------
 try:
     import tensorboard  # noqa: F401  -- just test availability
+
     _TENSORBOARD_AVAILABLE = True
 except ImportError:
     _TENSORBOARD_AVAILABLE = False
@@ -90,15 +87,14 @@ except ImportError:
     _tw_stub.SummaryWriter = _NoOpSummaryWriter  # type: ignore[attr-defined]
     sys.modules.setdefault("torch.utils.tensorboard", _tw_stub)
 
-from bpd.core.path import token_dim as compute_token_dim
-from bpd.data.dataset import D4RLTransitionDataset, TransitionDataset
-from bpd.data.normalizer import GaussianNormalizer
-from bpd.models.diffusion import BlockwiseDiffusion, DDPMSchedule
-from bpd.models.score_net import TrajectoryScoreNet
-from bpd.training.ema import EMA
-from bpd.training.trainer import BellmanPathDiffusionTrainer
-from bpd.core.objectives import BellmanDiffusionLoss
-from bpd.utils.serialization import save_checkpoint, save_config
+from bpd.core.objectives import BellmanDiffusionLoss  # noqa: E402
+from bpd.core.path import token_dim as compute_token_dim  # noqa: E402
+from bpd.data.dataset import D4RLTransitionDataset, TransitionDataset  # noqa: E402
+from bpd.models.diffusion import BlockwiseDiffusion, DDPMSchedule  # noqa: E402
+from bpd.models.score_net import TrajectoryScoreNet  # noqa: E402
+from bpd.training.ema import EMA  # noqa: E402
+from bpd.training.trainer import BellmanPathDiffusionTrainer  # noqa: E402
+from bpd.utils.serialization import save_checkpoint, save_config  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
@@ -292,6 +288,18 @@ def _build_parser() -> argparse.ArgumentParser:
         default=50_000,
         help="Maximum number of (x', W_+) entries in the suffix replay buffer.",
     )
+    p.add_argument(
+        "--replay_refresh_size",
+        type=int,
+        default=256,
+        help="Exact-key clean suffixes generated per replay refresh.",
+    )
+    p.add_argument(
+        "--replay_refresh_freq",
+        type=int,
+        default=5_000,
+        help="Refresh the frozen-teacher suffix replay every N updates.",
+    )
 
     # ------------------------------------------------------------------
     # Logging / checkpointing
@@ -322,12 +330,11 @@ def _build_parser() -> argparse.ArgumentParser:
         "--eval_policy",
         type=str,
         default="dataset",
-        choices=["dataset", "random", "argmax"],
+        choices=["dataset", "random"],
         help=(
             "Strategy used to sample next-actions a' ~ pi_e(.|s') during training.\n"
-            "  dataset : Use the stored dataset action at the next state (BC proxy).\n"
-            "  random  : Sample uniformly in [-1, 1]^act_dim.\n"
-            "  argmax  : Placeholder for a learned greedy policy (falls back to random)."
+            "  dataset : deterministic nearest-state dataset policy.\n"
+            "  random  : uniform stochastic policy in normalized action space."
         ),
     )
 
@@ -354,16 +361,21 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def _load_yaml_config(path: str) -> Dict[str, Any]:
-    """Load a YAML file and return its top-level mapping as a dict."""
+    """Load the small compositional YAML format used in ``configs/``.
+
+    ``defaults: [base]`` recursively merges ``base.yaml`` from the same
+    directory.  Component sections are flattened to the CLI names so the YAML
+    files and argparse entry point have one configuration schema.
+    """
     try:
         import yaml  # type: ignore[import]
     except ImportError as exc:
         raise ImportError(
-            "PyYAML is required to use --config.  "
-            "Install it with:  pip install pyyaml"
+            "PyYAML is required to use --config.  Install it with:  pip install pyyaml"
         ) from exc
 
-    with open(path, "r", encoding="utf-8") as fh:
+    config_path = Path(path).resolve()
+    with open(config_path, "r", encoding="utf-8") as fh:
         cfg = yaml.safe_load(fh)
 
     if cfg is None:
@@ -373,7 +385,26 @@ def _load_yaml_config(path: str) -> Dict[str, Any]:
             f"YAML config at '{path}' must be a mapping at the top level; "
             f"got {type(cfg).__name__}"
         )
-    return cfg
+    merged: Dict[str, Any] = {}
+    for default in cfg.pop("defaults", []) or []:
+        if not isinstance(default, str):
+            raise ValueError("config defaults entries must be file stems")
+        parent = config_path.parent / f"{default}.yaml"
+        merged.update(_load_yaml_config(str(parent)))
+
+    aliases = {
+        "num_steps": "diffusion_steps",
+        "ema_update_after": "ema_update_after_step",
+    }
+    for key, value in cfg.items():
+        if key in {"model", "diffusion", "training", "eval"}:
+            if not isinstance(value, dict):
+                raise ValueError(f"config section {key!r} must be a mapping")
+            for nested_key, nested_value in value.items():
+                merged[aliases.get(nested_key, nested_key)] = nested_value
+        else:
+            merged[key] = value
+    return merged
 
 
 def _merge_config_and_args(
@@ -392,8 +423,21 @@ def _merge_config_and_args(
         # did NOT explicitly pass the corresponding CLI flag.
         defaults = {a.dest: a.default for a in parser._actions}
         for key, value in yaml_cfg.items():
+            # Environment dimensions are declarations checked after loading;
+            # they are inferred from the actual dataset rather than trusted as
+            # model inputs.
+            if key in {
+                "obs_dim",
+                "act_dim",
+                "token_dim",
+                "n_trajectories",
+                "n_mc_episodes",
+            }:
+                continue
             if not hasattr(args, key):
-                logger.warning("YAML config key '%s' is not a recognised argument; skipping.", key)
+                logger.warning(
+                    "YAML config key '%s' is not a recognised argument; skipping.", key
+                )
                 continue
             # If the current value equals the parser default, the user did not
             # pass the flag explicitly, so the YAML value takes precedence.
@@ -419,7 +463,7 @@ def _make_eval_policy(
     (B, obs_dim), and returns the corresponding action(s).
 
     Args:
-        policy_type: One of 'dataset', 'random', or 'argmax'.
+        policy_type: One of 'dataset' or 'random'.
         dataset:     The offline dataset (used by 'dataset' policy).
         device:      Compute device for returned tensors.
 
@@ -435,8 +479,9 @@ def _make_eval_policy(
         # needing a policy network.
         #
         # For efficiency we precompute the state matrix on the target device.
-        all_states: torch.Tensor = dataset.states.to(device)   # (N, obs_dim)
-        all_actions: torch.Tensor = dataset.actions.to(device) # (N, act_dim)
+        logged_count = dataset.num_logged_transitions
+        all_states: torch.Tensor = dataset.states[:logged_count].to(device)
+        all_actions: torch.Tensor = dataset.actions[:logged_count].to(device)
 
         def dataset_policy(state: torch.Tensor) -> torch.Tensor:
             """Return the dataset action corresponding to the nearest stored state."""
@@ -445,11 +490,17 @@ def _make_eval_policy(
             if not batched:
                 state = state.unsqueeze(0)  # (1, obs_dim)
 
-            # L2 nearest-neighbour (approximate behavior cloning)
-            # dists: (B, N)
-            diffs = all_states.unsqueeze(0) - state.unsqueeze(1)  # (B, N, obs_dim)
-            dists = (diffs ** 2).sum(dim=-1)  # (B, N)
-            nearest_idx = dists.argmin(dim=-1)  # (B,)
+            # Chunk over the dataset to avoid materializing (B, N, obs_dim).
+            best_distance = torch.full((state.shape[0],), float("inf"), device=device)
+            nearest_idx = torch.zeros(state.shape[0], dtype=torch.long, device=device)
+            chunk_size = 65_536
+            for start in range(0, all_states.shape[0], chunk_size):
+                chunk = all_states[start : start + chunk_size]
+                distance = torch.cdist(state, chunk).square()
+                chunk_best, chunk_index = distance.min(dim=1)
+                improve = chunk_best < best_distance
+                best_distance[improve] = chunk_best[improve]
+                nearest_idx[improve] = start + chunk_index[improve]
             actions = all_actions[nearest_idx]  # (B, act_dim)
 
             return actions if batched else actions.squeeze(0)
@@ -457,6 +508,7 @@ def _make_eval_policy(
         return dataset_policy
 
     elif policy_type == "random":
+
         def random_policy(state: torch.Tensor) -> torch.Tensor:
             """Sample a uniformly random action in [-1, 1]^act_dim."""
             state = state.to(device)
@@ -467,28 +519,9 @@ def _make_eval_policy(
 
         return random_policy
 
-    elif policy_type == "argmax":
-        # Placeholder for a trained greedy policy.
-        # TODO: Replace with a real learned policy (e.g., IQL actor).
-        logger.warning(
-            "--eval_policy=argmax: No learned policy loaded; "
-            "falling back to uniform random actions."
-        )
-
-        def argmax_policy(state: torch.Tensor) -> torch.Tensor:
-            """Placeholder greedy policy (currently uniform random)."""
-            state = state.to(device)
-            if state.dim() == 1:
-                return torch.rand(act_dim, device=device) * 2.0 - 1.0
-            B = state.shape[0]
-            return torch.rand(B, act_dim, device=device) * 2.0 - 1.0
-
-        return argmax_policy
-
     else:
         raise ValueError(
-            f"Unknown eval_policy '{policy_type}'. "
-            "Choose from 'dataset', 'random', or 'argmax'."
+            f"Unknown eval_policy '{policy_type}'. Choose from 'dataset' or 'random'."
         )
 
 
@@ -536,7 +569,7 @@ def train(args: argparse.Namespace) -> None:
     logger.info("Loading D4RL dataset: %s", args.env)
     dataset = D4RLTransitionDataset(
         env_name=args.env,
-        normalizer=None,   # fitted automatically from the loaded data
+        normalizer=None,  # fitted automatically from the loaded data
         eval_policy_fn=None,
         device=device,
     )
@@ -607,6 +640,7 @@ def train(args: argparse.Namespace) -> None:
         schedule=schedule,
         token_dim=d_tok,
         loss_weight_fn=None,  # uniform lambda(t) = 1 (Ho et al. 2020 Eq. 14)
+        diffusion=diffusion,
     )
 
     # ------------------------------------------------------------------
@@ -637,37 +671,23 @@ def train(args: argparse.Namespace) -> None:
         "lr": args.lr,
         "ema_decay": args.ema_decay,
         "replay_buffer_size": args.replay_buffer_size,
+        "replay_refresh_size": args.replay_refresh_size,
+        "replay_refresh_freq": args.replay_refresh_freq,
         "diffusion_steps": args.diffusion_steps,
-        # checkpoint destination embedded in trainer config so periodic saves
-        # land in the right directory.
-        "_ckpt_dir": str(ckpt_dir),
+        "checkpoint_dir": str(ckpt_dir),
     }
 
     # ------------------------------------------------------------------
     # 11. Build trainer
     # ------------------------------------------------------------------
-    # The trainer exposes train_all_stages which orchestrates Algorithm 1.
-    # We wrap loss_fn to match the trainer's LossFn signature
-    # (pred, target, t) -> scalar.  The BellmanDiffusionLoss.forward has a
-    # richer signature; the trainer internally calls diffusion helpers and
-    # uses a simpler MSE loss_fn hook for the score matching step.
-    # We pass None so the trainer uses its default MSE loss (consistent with
-    # the Bellman objective used in trainer._build_training_targets).
     trainer = BellmanPathDiffusionTrainer(
         score_net=score_net,
         diffusion=diffusion,
-        schedule=schedule,
-        loss_fn=None,   # use trainer's default unweighted MSE
+        objective=loss_fn,
         optimizer=optimizer,
         ema=ema,
         config=trainer_config,
     )
-
-    # Override the default checkpoint path helper to use our log_dir.
-    def _ckpt_path_override(h: int, step: int) -> str:
-        return str(ckpt_dir / f"bpd_h{h:02d}_step{step:07d}.pt")
-
-    trainer._default_ckpt_path = staticmethod(_ckpt_path_override)  # type: ignore[method-assign]
 
     # ------------------------------------------------------------------
     # 12. Save run config before training starts
@@ -689,6 +709,8 @@ def train(args: argparse.Namespace) -> None:
         "ema_update_every": args.ema_update_every,
         "ema_update_after_step": args.ema_update_after_step,
         "replay_buffer_size": args.replay_buffer_size,
+        "replay_refresh_size": args.replay_refresh_size,
+        "replay_refresh_freq": args.replay_refresh_freq,
         "log_dir": str(log_dir),
         "log_freq": args.log_freq,
         "save_freq": args.save_freq,
@@ -709,6 +731,7 @@ def train(args: argparse.Namespace) -> None:
     writer = None
     try:
         from torch.utils.tensorboard import SummaryWriter  # type: ignore[import]
+
         writer = SummaryWriter(log_dir=str(log_dir / "tb"))
         logger.info("TensorBoard logging enabled: %s", log_dir / "tb")
     except ImportError:
@@ -721,8 +744,7 @@ def train(args: argparse.Namespace) -> None:
     # 14. Train all H stages (Algorithm 1)
     # ------------------------------------------------------------------
     logger.info(
-        "Starting BPD training: env=%s, H=%d, steps_per_horizon=%d, "
-        "total_steps=%d",
+        "Starting BPD training: env=%s, H=%d, steps_per_horizon=%d, total_steps=%d",
         args.env,
         args.max_horizon,
         args.steps_per_horizon,
@@ -750,6 +772,15 @@ def train(args: argparse.Namespace) -> None:
         "optimizer": optimizer.state_dict(),
         "global_step": trainer._global_step,
         "config": full_config,
+        "normalizer": {
+            "eps": dataset.normalizer.eps,
+            "obs_mean": dataset.normalizer.obs_mean,
+            "obs_std": dataset.normalizer.obs_std,
+            "act_mean": dataset.normalizer.act_mean,
+            "act_std": dataset.normalizer.act_std,
+            "rew_mean": dataset.normalizer.rew_mean,
+            "rew_std": dataset.normalizer.rew_std,
+        },
     }
     save_checkpoint(final_state, path=ckpt_dir, filename="final.pt")
     logger.info("Final checkpoint saved: %s", final_ckpt_path)
@@ -776,7 +807,9 @@ def main(argv: Optional[list] = None) -> None:
     logger.info("=" * 72)
     logger.info("Bellman Path Diffusion — Training Script")
     logger.info("=" * 72)
-    logger.info("Arguments:\n%s", "\n".join(f"  {k}={v}" for k, v in vars(args).items()))
+    logger.info(
+        "Arguments:\n%s", "\n".join(f"  {k}={v}" for k, v in vars(args).items())
+    )
 
     train(args)
 

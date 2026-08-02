@@ -38,13 +38,12 @@ Shapes used throughout:
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, field
-from typing import Callable, Optional, Protocol, runtime_checkable
+from dataclasses import dataclass
+from typing import Optional, Protocol, runtime_checkable
 
 import torch
 import torch.nn as nn
 from torch import Tensor
-
 
 # ---------------------------------------------------------------------------
 # Noise schedule
@@ -154,13 +153,17 @@ class DDPMSchedule:
         # Indices: betas[i] = β_{i+1}  (i = 0 ... T-1)
         #          alphas_bar[t] = ᾱ_t
         alphas_bar_prev = alphas_bar[:-1]  # ᾱ_{t-1} for t = 1 ... T
-        posterior_variance = betas * (1.0 - alphas_bar_prev) / (1.0 - alphas_bar[1:]).clamp(min=1e-8)
+        posterior_variance = (
+            betas * (1.0 - alphas_bar_prev) / (1.0 - alphas_bar[1:]).clamp(min=1e-8)
+        )
 
         posterior_mean_coef1 = (
             torch.sqrt(alphas_bar_prev) * betas / (1.0 - alphas_bar[1:]).clamp(min=1e-8)
         )
         posterior_mean_coef2 = (
-            torch.sqrt(alphas) * (1.0 - alphas_bar_prev) / (1.0 - alphas_bar[1:]).clamp(min=1e-8)
+            torch.sqrt(alphas)
+            * (1.0 - alphas_bar_prev)
+            / (1.0 - alphas_bar[1:]).clamp(min=1e-8)
         )
 
         return cls(
@@ -217,8 +220,7 @@ class ScoreNet(Protocol):
         Predicted noise ε, same shape as z_t: (B, h, token_dim).
     """
 
-    def __call__(self, z_t: Tensor, x: Tensor, t: Tensor) -> Tensor:
-        ...
+    def __call__(self, z_t: Tensor, x: Tensor, t: Tensor) -> Tensor: ...
 
 
 # ---------------------------------------------------------------------------
@@ -252,16 +254,24 @@ class BlockwiseDiffusion(nn.Module):
         Internally we convert ε → score via ``score = -ε / σ_t``.
     """
 
-    def __init__(self, schedule: DDPMSchedule, token_dim: int) -> None:
+    def __init__(
+        self,
+        schedule: DDPMSchedule,
+        token_dim: int,
+        clip_denoised: bool = False,
+    ) -> None:
         super().__init__()
         self.schedule = schedule
         self.token_dim = token_dim
         self.T = schedule.T
+        self.clip_denoised = bool(clip_denoised)
 
         # Register all schedule tensors as buffers so they move with .to(device)
         self.register_buffer("alphas_bar", schedule.alphas_bar)
         self.register_buffer("sqrt_alphas_bar", schedule.sqrt_alphas_bar)
-        self.register_buffer("sqrt_one_minus_alphas_bar", schedule.sqrt_one_minus_alphas_bar)
+        self.register_buffer(
+            "sqrt_one_minus_alphas_bar", schedule.sqrt_one_minus_alphas_bar
+        )
         self.register_buffer("betas", schedule.betas)
         self.register_buffer("alphas", schedule.alphas)
         self.register_buffer("posterior_variance", schedule.posterior_variance)
@@ -325,7 +335,7 @@ class BlockwiseDiffusion(nn.Module):
         assert d == self.token_dim, (
             f"token_dim mismatch: w has dim {d}, expected {self.token_dim}"
         )
-        assert t.shape == (B,), f"t must have shape (B,)={( B,)}; got {t.shape}"
+        assert t.shape == (B,), f"t must have shape (B,)={(B,)}; got {t.shape}"
 
         if noise is None:
             noise = torch.randn_like(w)  # (B, h, token_dim)
@@ -386,7 +396,7 @@ class BlockwiseDiffusion(nn.Module):
 
         # σ_t = sqrt(1 - ᾱ_t)
         sigma_t = self._extract(self.sqrt_one_minus_alphas_bar, t, shape)  # (B,h,d)
-        sigma_t_sq = sigma_t ** 2
+        sigma_t_sq = sigma_t**2
 
         # α_t = sqrt(ᾱ_t)
         alpha_t = self._extract(self.sqrt_alphas_bar, t, shape)  # (B,h,d)
@@ -493,8 +503,11 @@ class BlockwiseDiffusion(nn.Module):
 
         # Estimate z_0 from predicted noise
         z0_hat = self._predict_z0_from_noise(z_t, t_tensor, score_net_output)
-        # Clip estimated z_0 for stability (standard DDPM practice)
-        z0_hat = z0_hat.clamp(-1.0, 1.0)
+        # Clipping is valid only when every token field is normalized to
+        # [-1, 1].  BPD also supports Gaussian-normalized continuous tokens,
+        # so the paper-faithful default leaves z0_hat unconstrained.
+        if self.clip_denoised:
+            z0_hat = z0_hat.clamp(-1.0, 1.0)
 
         # Compute posterior mean μ̃_θ
         mean = self._q_posterior_mean(z_t, z0_hat, t_tensor)
@@ -589,9 +602,9 @@ class BlockwiseDiffusion(nn.Module):
             Noisy trajectory at noise level t_stop,
             shape (batch_size, h, token_dim).
         """
-        if not (1 <= t_stop < self.T):
+        if not (0 <= t_stop <= self.T):
             raise ValueError(
-                f"t_stop must satisfy 1 ≤ t_stop < T={self.T}; got {t_stop}"
+                f"t_stop must satisfy 0 ≤ t_stop ≤ T={self.T}; got {t_stop}"
             )
 
         z = torch.randn(batch_size, h, self.token_dim, device=device)
@@ -670,5 +683,6 @@ class BlockwiseDiffusion(nn.Module):
         return (
             f"BlockwiseDiffusion("
             f"T={self.T}, "
-            f"token_dim={self.token_dim})"
+            f"token_dim={self.token_dim}, "
+            f"clip_denoised={self.clip_denoised})"
         )

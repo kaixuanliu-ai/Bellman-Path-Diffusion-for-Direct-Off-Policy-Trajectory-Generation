@@ -1,6 +1,6 @@
 # Bellman Path Diffusion for Direct Off-Policy Trajectory Generation
 
-Official implementation of **Bellman Path Diffusion (BPD)**, a trajectory-space extension of the probability-path Bellman construction from [Temporal Difference Flows](https://arxiv.org/abs/2506.00890).
+Reference implementation of **Bellman Path Diffusion (BPD)**, a trajectory-space extension of the probability-path Bellman construction from [Temporal Difference Flows](https://arxiv.org/abs/2503.09817).
 
 ## Overview
 
@@ -52,7 +52,8 @@ scripts/
 tests/
 ├── test_path.py         # Path algebra, length law, value identity
 ├── test_diffusion.py    # Blockwise diffusion, score targets
-└── test_objectives.py   # Loss, mixture-score regression (Lemma 1)
+├── test_objectives.py   # Exact stop/continuation targets and loss
+└── test_training.py     # Stagewise trainer, replay, decoder integration
 ```
 
 ## Installation
@@ -121,18 +122,36 @@ H = 8  # max horizon
 
 schedule = DDPMSchedule.make_cosine(T=1000)
 diffusion = BlockwiseDiffusion(schedule, token_dim)
-score_net = TrajectoryScoreNet(obs_dim=obs_dim, act_dim=act_dim, token_dim=token_dim)
+score_net = TrajectoryScoreNet(
+    obs_dim=obs_dim,
+    act_dim=act_dim,
+    token_dim=token_dim,
+    max_horizon=H,
+)
 
-loss_fn = BellmanDiffusionLoss(gamma=gamma, schedule=schedule, token_dim=token_dim)
+loss_fn = BellmanDiffusionLoss(
+    gamma=gamma,
+    schedule=schedule,
+    token_dim=token_dim,
+    diffusion=diffusion,
+)
 
 # Teacher score function (frozen EMA at horizon h-1)
 @torch.no_grad()
-def teacher_score_fn(z, t, x, h_sub):
+def teacher_noise_fn(z, t, x, h_sub):
     return score_net(z, t, x, h_sub)
 
 # Training step
 replay_buffer = SuffixReplayBuffer(max_size=50000, suffix_horizon=H-1, token_dim=token_dim)
-loss = loss_fn(score_net, teacher_score_fn, batch, h=H, replay_buffer=replay_buffer)
+next_action = evaluation_policy(batch.next_state)  # a' ~ pi_e(. | s')
+loss = loss_fn(
+    score_net,
+    teacher_noise_fn,
+    batch,
+    h=H,
+    next_action=next_action,
+    replay_buffer=replay_buffer,
+)
 loss.backward()
 ```
 
@@ -146,9 +165,9 @@ For $h = 1, \ldots, H$:
 3. For each gradient step:
    - Sample $(s, a, r, s') \sim \mathcal{D}$, draw $a' \sim \pi_e(\cdot|s')$, form token $y = (r, s', a')$
    - Sample $t \sim p_T$, draw branch $C \sim \text{Bernoulli}(\gamma)$
-   - **Stop branch** ($C=0$ or $h=1$): $w = \text{stop}_h(y)$, target $u = \nabla_z \log q_{t|0}^{(h)}(z|w)$ (analytic)
-   - **Continue branch** ($C=1$, $h>1$): retrieve $w_+ \sim \hat{\mathbb{M}}_{\bar\theta,h-1}(\cdot|x')$ from replay, $w = \text{push}_h(y, w_+)$, target $u = [\text{analytic head};\, \text{sg}[s_{\bar\theta,h-1}(z_+, t|x')]]$
-   - Loss: $\lambda(t)\|s_\theta(z_t, t|x, h) - u\|_2^2$
+   - **Stop branch** ($C=0$ or $h=1$): predict the sampled noise for the full stopped path.
+   - **Continue branch** ($C=1$, $h>1$): retrieve $w_+ \sim \hat{\mathbb{M}}_{\bar\theta,h-1}(\cdot|x')$ using the exact `(s', a')` key; predict `[head noise; frozen teacher suffix noise]` at the same $t$.
+   - Loss: $\lambda(t)\|\epsilon_\theta(z_t,t|x,h)-\epsilon_{\mathrm{target}}\|_2^2$. The branch draw supplies the only factor of $\gamma$.
 
 ### Generation (Algorithm 2)
 
@@ -178,16 +197,18 @@ No $\gamma^t$ factor — geometric stopping already implements discounting.
 | **Theorem 6** (Return error bound) | $\delta_H^G \leq \sum_{h=1}^H \gamma^{H-h}\varepsilon_h^G$ (Eq. 68) |
 | **Corollary 1** (OPE error) | $|\bar{J}_H(\pi_e) - J_H(\pi_e)| \leq \delta_H^G$ (Eq. 61) |
 
-## Score Network Architecture
+## Noise Network Architecture
 
 A single `TrajectoryScoreNet` handles all horizons $h \in \{1, \ldots, H\}$ via:
 - **Token projection**: each block $z_j \in \mathbb{R}^{d_\text{tok}} \to e_j \in \mathbb{R}^D$
 - **Time embedding**: sinusoidal $\to$ MLP (DiT-style, Peebles & Xie 2023)
 - **Horizon embedding**: MLP over integer $h$
 - **Conditioning**: linear projection of $x = (s, a)$
-- **AdaLN Transformer blocks**: adaptive layer norm modulated by time + horizon embedding
-- **Variable-length masking**: real tokens attend only to positions $j < h$
-- **Output projection**: $e_j \to \text{score}_j \in \mathbb{R}^{d_\text{tok}}$
+- **AdaLN-Zero Transformer blocks**: adaptive layer norm modulated by time + horizon + state-action conditioning
+- **Variable length**: each homogeneous stage passes exactly the first $h$ blocks, equivalent to masking a padded shared-H tensor
+- **Output projection**: $e_j \to \epsilon_j \in \mathbb{R}^{d_\text{tok}}$; the score is $-\epsilon_j/\sigma_t$
+
+See [`docs/IMPLEMENTATION_AUDIT.md`](docs/IMPLEMENTATION_AUDIT.md) for the paper-to-code map, reference implementations consulted, and known approximation boundaries.
 
 ## Citation
 

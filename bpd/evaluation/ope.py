@@ -44,7 +44,6 @@ import numpy as np
 import torch
 from torch import Tensor
 
-from bpd.core.path import compute_return, path_length
 from bpd.models.diffusion import BlockwiseDiffusion
 
 logger = logging.getLogger(__name__)
@@ -69,8 +68,8 @@ def _geometric_length_pmf(h: int, gamma: float) -> np.ndarray:
         1-D numpy array of shape (h,) indexed from l=1 to l=h.
     """
     pmf = np.empty(h, dtype=np.float64)
-    for l in range(1, h):
-        pmf[l - 1] = (1.0 - gamma) * gamma ** (l - 1)
+    for length in range(1, h):
+        pmf[length - 1] = (1.0 - gamma) * gamma ** (length - 1)
     pmf[h - 1] = gamma ** (h - 1)
     return pmf
 
@@ -138,22 +137,9 @@ class OPEEvaluator:
                           * ``"act_dim"`` (int, required): action dim.
                           * ``"gamma"`` (float, default 0.99): discount γ
                             used to compute the theoretical length distribution.
-                          * ``"pad_threshold"`` (float, default 0.5):
-                            threshold on the reward channel of a decoded token
-                            below which the token is classified as padding in
-                            :meth:`decode_trajectory`.  Padding tokens produced
-                            by the forward process are zero-encoded; after
-                            denoising the first coordinate drifts towards zero
-                            for padding positions.  A token is declared padding
-                            when ``|token[0]| < pad_threshold`` AND the token
-                            norm is below ``norm_threshold``.
                           * ``"norm_threshold"`` (float, default 0.3):
-                            minimum L2 norm for a decoded token to be
-                            considered real.  Used jointly with
-                            ``pad_threshold``.
-                          * ``"clip_denoised"`` (bool, default True):
-                            whether to clip z_0 estimates to ``[-1, 1]``
-                            during the reverse chain.
+                            distance threshold around the zero padding
+                            embedding used by the practical decoder.
 
     Example::
 
@@ -171,7 +157,9 @@ class OPEEvaluator:
             },
         )
         initial_states = torch.zeros(32, 17, device="cuda")
-        estimate = evaluator.estimate_return(initial_states, n_trajectories=32, device="cuda")
+        estimate = evaluator.estimate_return(
+            initial_states, n_trajectories=32, device="cuda"
+        )
     """
 
     def __init__(
@@ -203,9 +191,9 @@ class OPEEvaluator:
         self.token_dim: int = 1 + self.obs_dim + self.act_dim
 
         self.gamma: float = float(config.get("gamma", 0.99))
-        self.pad_threshold: float = float(config.get("pad_threshold", 0.5))
         self.norm_threshold: float = float(config.get("norm_threshold", 0.3))
-        self.clip_denoised: bool = bool(config.get("clip_denoised", True))
+        if self.H < 1:
+            raise ValueError("horizon must be positive")
 
         # Validate token_dim matches diffusion model.
         if self.diffusion.token_dim != self.token_dim:
@@ -228,7 +216,7 @@ class OPEEvaluator:
 
         For each of the ``n_trajectories`` Monte-Carlo samples:
 
-          1. Draw s_0 from ``initial_states`` (cycling if necessary).
+          1. Draw s_0 from ``initial_states`` with replacement.
           2. Draw a_0 ~ π_e(·|s_0) using ``eval_policy_fn``.
           3. Concatenate x_0 = (s_0, a_0) as the conditioning context.
           4. Sample z_T ~ N(0, I_{H * token_dim}).
@@ -238,7 +226,7 @@ class OPEEvaluator:
         Args:
             initial_states: Tensor of shape (N_init, obs_dim) containing
                             possible initial states s_0 ~ μ_0.  Sampled with
-                            replacement (cycling) to fill ``n_trajectories``
+                            replacement to fill ``n_trajectories``
                             parallel chains.
             n_trajectories: Number M of Monte-Carlo trajectories to generate.
             device:         Compute device for diffusion sampling.
@@ -250,10 +238,12 @@ class OPEEvaluator:
         """
         device = torch.device(device) if isinstance(device, str) else device
 
-        # ---- Step 1: sample s_0 ~ μ_0 (cycling over provided initial_states) ---
+        # ---- Step 1: sample s_0 ~ μ_0 ----------------------------------------
         n_init = initial_states.shape[0]
-        # Indices with cycling for the n_trajectories batch.
-        idx = torch.arange(n_trajectories, device=device) % n_init
+        if n_init < 1:
+            raise ValueError("initial_states must contain at least one sample")
+        # Independent draws with replacement implement s_0 ~ mu_0.
+        idx = torch.randint(0, n_init, (n_trajectories,), device=device)
         s0 = initial_states[idx].to(device=device, dtype=torch.float32)  # (M, obs_dim)
 
         # ---- Step 2: sample a_0 ~ π_e(·|s_0) ---
@@ -289,6 +279,20 @@ class OPEEvaluator:
     # -----------------------------------------------------------------------
     # OPE estimator (Eq. 59)
     # -----------------------------------------------------------------------
+
+    def _unnormalize_rewards(self, rewards: Tensor, device: torch.device) -> Tensor:
+        if self.normalizer is None:
+            return rewards
+        rewards_np = rewards.detach().cpu().numpy()
+        if hasattr(self.normalizer, "unnormalize_rew"):
+            values = self.normalizer.unnormalize_rew(rewards_np)
+        elif hasattr(self.normalizer, "unnormalize"):
+            values = self.normalizer.unnormalize(
+                rewards_np.reshape(-1, 1), key="rewards"
+            )
+        else:
+            raise TypeError("normalizer cannot unnormalize rewards")
+        return torch.as_tensor(values, dtype=torch.float32, device=device).reshape(-1)
 
     def estimate_return(
         self,
@@ -328,12 +332,7 @@ class OPEEvaluator:
             # Rewards are stored in the first element (index 0) of each token.
             rewards = traj[:, 0]  # (L_m,)
             # Unnormalize rewards if a normalizer is available.
-            if self.normalizer is not None and hasattr(self.normalizer, "unnormalize"):
-                rewards_np = rewards.cpu().numpy().reshape(-1, 1)
-                rewards_np = self.normalizer.unnormalize(rewards_np, key="rewards")
-                rewards = torch.tensor(
-                    rewards_np.reshape(-1), dtype=torch.float32, device=device
-                )
+            rewards = self._unnormalize_rewards(rewards, device)
             # Eq. 59: undiscounted sum (geometric survival handles discounting).
             total_return += float(rewards.sum().item())
 
@@ -382,12 +381,12 @@ class OPEEvaluator:
 
         lengths = [traj.shape[0] for traj in trajectories]
         # Clip to [1, H]: treat length 0 (all-padding) as length 1 for PMF.
-        lengths_clipped = [max(1, min(l, self.H)) for l in lengths]
+        lengths_clipped = [max(1, min(length, self.H)) for length in lengths]
 
         # Empirical PMF over {1, ..., H}.
         counts = np.zeros(self.H, dtype=np.float64)
-        for l in lengths_clipped:
-            counts[l - 1] += 1.0
+        for length in lengths_clipped:
+            counts[length - 1] += 1.0
         empirical = counts / M  # (H,)
 
         # Theoretical PMF from Eq. 14.
@@ -431,18 +430,16 @@ class OPEEvaluator:
 
           1. Treating ``z`` (already denoised to z_0 by the reverse chain) as
              the path tensor.
-          2. Classifying each token position as real or padding using the
-             pad-detection heuristic (reward channel close to zero AND token
-             norm below threshold).
+          2. Classifying a token as padding when it lies near the zero padding
+             embedding in full token space.
           3. Identifying the contiguous prefix of real tokens (padding is
              structurally appended after the last real token per Eq. 4-5).
 
-        A token at position j is classified as **padding** when:
-          ``torch.norm(z[j]) < norm_threshold``  OR
-          ``|z[j, 0]| < pad_threshold``
+        A token at position j is classified as padding when
+        ``torch.norm(z[j]) < norm_threshold``.  The reward coordinate alone is
+        never used: zero reward is a valid real transition.
 
-        This heuristic is calibrated by ``config["pad_threshold"]`` and
-        ``config["norm_threshold"]``.
+        This practical heuristic is calibrated by ``config["norm_threshold"]``.
 
         Args:
             z: Denoised path tensor of shape (h, token_dim) – the z_0 output
@@ -469,9 +466,7 @@ class OPEEvaluator:
                 f"z must be 2-D (h, token_dim); got shape {tuple(z.shape)}"
             )
         if z.shape[0] != h:
-            raise ValueError(
-                f"z.shape[0]={z.shape[0]} does not match h={h}"
-            )
+            raise ValueError(f"z.shape[0]={z.shape[0]} does not match h={h}")
         if z.shape[1] != self.token_dim:
             raise ValueError(
                 f"z.shape[1]={z.shape[1]} does not match token_dim={self.token_dim}"
@@ -481,18 +476,17 @@ class OPEEvaluator:
 
         # --- Padding detection heuristic ---
         # Padding tokens are encoded as zero vectors; after the reverse chain
-        # they are approximately near zero.  We use two complementary signals:
-        #   (a) the reward channel |z[j, 0]| < pad_threshold
-        #   (b) the L2 token norm  ||z[j]|| < norm_threshold
-        reward_channel = tokens[:, 0].abs()                     # (h,)
-        token_norms = tokens.norm(dim=-1)                       # (h,)
-
-        # A position is padding if EITHER signal fires.
-        is_padding = (reward_channel < self.pad_threshold) | (token_norms < self.norm_threshold)
+        # they are approximately near zero in full token space.
+        token_norms = tokens.norm(dim=-1)  # (h,)
+        is_padding = token_norms < self.norm_threshold
 
         # BPD paths have a suffix structure: find the first padding position and
         # mark everything from that point on as padding.
         is_real = ~is_padding  # (h,) initial guess
+        # Every Bellman path contains its current transition (Eq. 6), even if
+        # that transition's numeric token happens to be close to zero.
+        if h > 0:
+            is_real[0] = True
 
         # Enforce prefix-real / suffix-padding invariant (Eq. 4-5):
         # once is_real[j] = False, all subsequent positions must also be False.
@@ -604,12 +598,7 @@ class OPEEvaluator:
             if traj.shape[0] == 0:
                 continue
             rewards = traj[:, 0]
-            if self.normalizer is not None and hasattr(self.normalizer, "unnormalize"):
-                rewards_np = rewards.cpu().numpy().reshape(-1, 1)
-                rewards_np = self.normalizer.unnormalize(rewards_np, key="rewards")
-                rewards = torch.tensor(
-                    rewards_np.reshape(-1), dtype=torch.float32, device=device
-                )
+            rewards = self._unnormalize_rewards(rewards, device)
             total_return += float(rewards.sum().item())
 
         estimate = torch.tensor(

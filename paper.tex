@@ -1,0 +1,1621 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb,amsfonts,amsthm,mathtools,bm}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{booktabs}
+\usepackage[numbers,sort&compress]{natbib}
+\usepackage{microtype}
+\usepackage{xcolor}
+\usepackage[hidelinks]{hyperref}
+\usepackage[nameinlink,capitalise,noabbrev]{cleveref}
+
+\newtheorem{theorem}{Theorem}
+\newtheorem{proposition}[theorem]{Proposition}
+\newtheorem{lemma}[theorem]{Lemma}
+\newtheorem{corollary}[theorem]{Corollary}
+\theoremstyle{definition}
+\newtheorem{definition}[theorem]{Definition}
+\newtheorem{assumption}[theorem]{Assumption}
+\theoremstyle{remark}
+\newtheorem{remark}[theorem]{Remark}
+
+\newcommand{\Sspace}{\mathcal S}
+\newcommand{\Aspace}{\mathcal A}
+\newcommand{\Xspace}{\mathcal X}
+\newcommand{\Yspace}{\mathcal Y}
+\newcommand{\Wspace}{\mathcal W}
+\newcommand{\Pspace}{\mathcal P}
+\newcommand{\Normal}{\mathcal N}
+\newcommand{\Unif}{\operatorname{Unif}}
+\newcommand{\TV}{\operatorname{TV}}
+\newcommand{\Law}{\operatorname{Law}}
+\newcommand{\E}{\mathbb E}
+\newcommand{\R}{\mathbb R}
+\newcommand{\nextx}{\operatorname{next}}
+\newcommand{\stoptraj}{\operatorname{stop}}
+\newcommand{\pushtraj}{\operatorname{push}}
+\newcommand{\sg}{\operatorname{sg}}
+\newcommand{\emptytok}{\bot}
+\newcommand{\dd}{\mathrm d}
+\newcommand{\score}{s}
+\newcommand{\Bell}{\mathcal B}
+\newcommand{\Diff}{\mathcal D}
+\newcommand{\Student}{\theta}
+\newcommand{\Teacher}{\bar\theta}
+\newcommand{\targetpi}{\pi_e}
+\newcommand{\branchstop}{\rightarrow}
+\newcommand{\branchcont}{\curvearrowright}
+
+\title{Bellman Path Diffusion for Direct Off-Policy Trajectory Generation}
+\author{}
+\date{}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+We study off-policy evaluation from one-step transition data when the desired
+output is a complete reward-bearing trajectory under a fixed evaluation
+policy. We introduce Bellman Path Diffusion, a trajectory-space extension of
+the probability-path construction in Temporal Difference Flows. A target-policy
+path with maximum capacity $h$ is defined recursively: one real transition is
+always generated, after which the path stops with probability $1-\gamma$ or
+continues with a target-policy suffix with probability $\gamma$. Independent
+blockwise corruption preserves this decomposition at every diffusion time and
+gives both branches the same Gaussian source. This yields a single score
+regression objective. The stopping target is analytic, while the continuation
+target concatenates the analytic score of the current transition with the
+frozen score of the future suffix at the same noise level. Under population
+realizability, stagewise training recovers the exact noisy path law, and one
+reverse diffusion directly generates the full padded trajectory tensor.
+Geometric survival implements discounting, so the undiscounted reward sum of
+the generated path is an unbiased estimator of the truncated discounted
+return. We further prove full-law stability in total variation, a
+return-sensitive contraction and OPE error bound, and an exact replay
+equivalence that permits clean suffix caching without changing the population
+noise-level objective.
+\end{abstract}
+
+\section{Introduction}
+\label{sec:introduction}
+
+Off-policy evaluation asks for the performance of a policy using data collected
+by other policies. Classical estimators compress the future into a scalar value
+or an occupancy correction. A generative alternative is to learn the complete
+future distribution and evaluate arbitrary reward or safety functionals on
+samples from that distribution. Standard world models are poorly matched to
+this objective because they are unrolled one environment step at a time at
+inference, causing model error to compound with horizon.
+
+Geometric horizon models avoid environment-time unrolling by directly
+sampling a discounted future state. Temporal Difference Flows
+\citep{farebrother2025tdflow} makes this idea compatible with modern flow and
+diffusion models. Its central observation is not merely that one can train a
+generative model on Bellman-backed samples. The stronger observation is that
+the two components of the successor-measure Bellman equation define two
+probability paths with a common source. Regressing their vector fields or
+scores with weights $1-\gamma$ and $\gamma$ directly constructs the
+probability path of the Bellman mixture.
+
+A future-state sample, however, is not a trajectory. It does not preserve the
+joint dependence among rewards, states, and evaluation-policy actions, and it
+cannot evaluate path-dependent quantities without additional assumptions. We
+therefore lift the probability-path Bellman construction from successor states
+to reward-bearing trajectories. This lift is not obtained by first generating
+clean teacher trajectories and then applying ordinary diffusion training. The
+Bellman decomposition is imposed directly at every diffusion time.
+
+Our construction has one central identity. Let $m_{h,t}^{\targetpi}$ denote
+the noisy law at diffusion time $t$ of an evaluation-policy trajectory with at
+most $h$ reward-bearing transitions. Then
+\begin{equation}
+\boxed{
+ m_{h,t}^{\targetpi}
+ =
+ (1-\gamma)\,m_{h,t}^{\branchstop}
+ +
+ \gamma\,m_{h,t}^{\branchcont},
+ \qquad t\in[0,T].
+}
+\label{eq:intro-mixture}
+\end{equation}
+The stopping path contains one real transition followed by padding. The
+continuation path contains one real transition followed by a noisy suffix drawn
+from the $(h-1)$-step teacher at the same diffusion time. Both paths start from
+the same Gaussian source at $t=T$. Their component scores are tractable, so
+\cref{eq:intro-mixture} induces a single score-matching objective whose
+population minimizer is $\nabla\log m_{h,t}^{\targetpi}$. At no point is a
+sampling-time policy guidance term added to the reverse process.
+
+Our contributions are as follows.
+\begin{enumerate}
+    \item We define a finite-depth target-policy path recursion whose
+    nonpadding blocks form a valid reward-bearing trajectory and whose
+    undiscounted reward sum represents the truncated discounted return.
+    \item We prove that independent blockwise corruption commutes with this
+    recursion. The stopping and continuation branches therefore form an exact
+    mixture at every noise level and share a common Gaussian source.
+    \item We derive the corresponding score backup. The current-transition
+    score is analytic, the suffix score is supplied by a frozen shorter-horizon
+    teacher, and their branch regression recovers the score of the target
+    mixture without an auxiliary Bellman penalty or sampling-time guidance.
+    \item We establish exact stagewise recovery, replay-buffer equivalence,
+    full-law and return-sensitive error propagation, and direct OPE from one
+    reverse diffusion.
+\end{enumerate}
+
+\begin{remark}[Terminology and scope]
+\label{rem:terminology}
+The word Bellman in this paper refers to the finite-depth path recursion that
+prepends one real transition to a shorter future suffix. It is not the
+stationary discounted-occupancy flow equation used by DICE methods. The core
+technical statement is that this path recursion persists under blockwise
+corruption and hence determines a score recursion at every diffusion time.
+\end{remark}
+
+\section{Problem Setup}
+\label{sec:setup}
+
+Consider a discounted Markov decision process
+\begin{equation}
+\mathcal M
+=
+(\Sspace,\Aspace,P^\star,\mu_0,\gamma),
+\qquad
+\gamma\in(0,1),
+\label{eq:mdp}
+\end{equation}
+and a fixed evaluation policy $\targetpi(\dd a\mid s)$. Let
+\begin{equation}
+\Xspace:=\Sspace\times\Aspace,
+\qquad
+x=(s,a)\in\Xspace.
+\end{equation}
+The joint reward-transition kernel is
+\begin{equation}
+P^\star(\dd r,\dd s'\mid s,a).
+\label{eq:environment-kernel}
+\end{equation}
+Define a reward-bearing transition token
+\begin{equation}
+y=(r,s',a')\in
+\Yspace:=\R\times\Sspace\times\Aspace,
+\end{equation}
+and the evaluation-policy token kernel
+\begin{equation}
+\boxed{
+\kappa_{\targetpi}(\dd y\mid x)
+:=
+P^\star(\dd r,\dd s'\mid s,a)
+\targetpi(\dd a'\mid s').
+}
+\label{eq:token-kernel}
+\end{equation}
+We write
+\begin{equation}
+\nextx(y):=(s',a').
+\end{equation}
+The offline dataset is
+\begin{equation}
+\mathcal D
+=
+\{(s_i,a_i,r_i,s_i')\}_{i=1}^N
+\end{equation}
+and may have been collected by arbitrary behavior policies.
+
+\begin{assumption}[Conditional validity and coverage]
+\label{ass:coverage}
+Conditioned on $X=(s,a)$, every logged pair $(R,S')$ follows
+$P^\star(\cdot,\cdot\mid s,a)$. Every state-action pair reached by
+$\targetpi$ before the chosen truncation horizon $H$ lies in the support of
+the dataset state-action distribution.
+\end{assumption}
+
+Under \cref{ass:coverage}, drawing $(s,a,r,s')$ from the dataset and then
+sampling
+\begin{equation}
+a'\sim\targetpi(\cdot\mid s')
+\end{equation}
+produces an unbiased sample $Y\sim\kappa_{\targetpi}(\cdot\mid X)$. No
+behavior-policy density or importance weight is needed.
+
+\section{Evaluation-Policy Bellman Recursion on Path Space}
+\label{sec:path-flow}
+
+\subsection{Stopped reward-bearing trajectories}
+
+Let $\emptytok$ be a padding token. For $h\geq 1$, define
+\begin{equation}
+\Wspace_h
+:=
+(\Yspace\cup\{\emptytok\})^h,
+\qquad
+\Wspace_0:=\{\varnothing\}.
+\end{equation}
+A valid element contains a sequence of transition tokens followed by padding.
+For $y\in\Yspace$, define
+\begin{equation}
+\stoptraj_h(y)
+:=
+(y,\emptytok,\ldots,\emptytok)
+\in\Wspace_h.
+\label{eq:stop-map}
+\end{equation}
+For $w=(w_0,\ldots,w_{h-2})\in\Wspace_{h-1}$, define
+\begin{equation}
+\pushtraj_h(y,w)
+:=
+(y,w_0,\ldots,w_{h-2})
+\in\Wspace_h.
+\label{eq:push-map}
+\end{equation}
+The empty case satisfies $\pushtraj_1(y,\varnothing)=(y)$.
+
+Let $L_h(w)$ be the number of nonpadding tokens in $w$. Once padding occurs,
+all later blocks are padding. Environment termination is represented by an
+absorbing state-action pair with zero future rewards.
+
+\subsection{Finite-depth Bellman recursion}
+
+Define the conditional path laws recursively by
+\begin{equation}
+\mathbb M_0^{\targetpi}(\cdot\mid x)
+:=
+\delta_{\varnothing},
+\label{eq:path-base}
+\end{equation}
+and, for $h\geq 1$,
+\begin{equation}
+\boxed{
+\begin{aligned}
+\mathbb M_h^{\targetpi}(\dd w\mid x)
+:=
+\int \kappa_{\targetpi}(\dd y\mid x)
+\Big[
+&(1-\gamma)
+\delta_{\stoptraj_h(y)}(\dd w)
+\\
+&+
+\gamma
+(\pushtraj_h(y,\cdot))_{\#}
+\mathbb M_{h-1}^{\targetpi}
+(\dd w\mid\nextx(y))
+\Big].
+\end{aligned}
+}
+\label{eq:path-bellman}
+\end{equation}
+The stopping branch injects one real evaluation-policy transition. The
+continuation branch prepends the same transition to a future suffix. We denote
+the operator mapping a conditional law on $\Wspace_{h-1}$ to one on
+$\Wspace_h$ by $\Bell_h^{\targetpi}$, so that
+\begin{equation}
+\mathbb M_h^{\targetpi}
+=
+\Bell_h^{\targetpi}\mathbb M_{h-1}^{\targetpi}.
+\end{equation}
+
+\begin{proposition}[Trajectory semantics]
+\label{prop:path-semantics}
+Let $W_h\sim\mathbb M_h^{\targetpi}(\cdot\mid X_0=x_0)$. Conditional on
+$L_h(W_h)>t$, its valid tokens satisfy
+\begin{equation}
+(R_t,S_{t+1})
+\sim
+P^\star(\cdot,\cdot\mid S_t,A_t),
+\qquad
+A_{t+1}
+\sim
+\targetpi(\cdot\mid S_{t+1}).
+\label{eq:valid-path}
+\end{equation}
+Moreover,
+\begin{equation}
+\Pr(L_h(W_h)>t\mid X_0=x_0)=\gamma^t,
+\qquad
+0\leq t\leq h-1.
+\label{eq:survival}
+\end{equation}
+Equivalently, the censored length distribution is
+\begin{equation}
+\boxed{
+\Pr(L_h=\ell)
+=
+\begin{cases}
+(1-\gamma)\gamma^{\ell-1}, & 1\leq \ell<h,\\
+\gamma^{h-1}, & \ell=h.
+\end{cases}
+}
+\label{eq:length-law}
+\end{equation}
+Consequently,
+\begin{equation}
+\boxed{
+\E_{W_h\sim\mathbb M_h^{\targetpi}(\cdot\mid x_0)}
+\left[
+\sum_{t=0}^{L_h(W_h)-1}R_t
+\right]
+=
+\E_{\targetpi}
+\left[
+\sum_{t=0}^{h-1}\gamma^tR_t
+\middle|
+X_0=x_0
+\right].
+}
+\label{eq:value-identity}
+\end{equation}
+\end{proposition}
+
+\begin{proof}
+Equation~\eqref{eq:valid-path} follows by recursively expanding
+\cref{eq:path-bellman}. A token at depth $t$ exists exactly when the first
+$t$ continuation decisions succeed, which has probability $\gamma^t$. Hence
+\begin{align}
+\E\left[\sum_{t=0}^{L_h(W_h)-1}R_t\right]
+&=
+\sum_{t=0}^{h-1}
+\E\left[\bm 1\{L_h(W_h)>t\}R_t\right]
+\\
+&=
+\sum_{t=0}^{h-1}
+\gamma^t\E_{\targetpi}[R_t\mid X_0=x_0].
+\end{align}
+\end{proof}
+
+\begin{remark}[Why geometric stopping is useful]
+The random stopping rule is the probabilistic representation of
+discounting used by normalized successor measures. It converts a discounted
+sum into an undiscounted reward sum on a random-length path. The fixed tensor
+capacity $h$ only censors paths that survive beyond the computational horizon;
+the last length bin in \cref{eq:length-law} therefore contains all surviving
+mass.
+\end{remark}
+
+\section{Bellman Probability Paths}
+\label{sec:probability-paths}
+
+\subsection{Blockwise forward diffusion}
+
+Let
+\begin{equation}
+\varphi:
+\Yspace\cup\{\emptytok\}
+\to
+\R^d
+\end{equation}
+be an injective token representation. For
+$w=(w_0,\ldots,w_{h-1})$, write
+\begin{equation}
+\Phi_h(w)
+:=
+(\varphi(w_0),\ldots,\varphi(w_{h-1}))
+\in\R^{hd}.
+\end{equation}
+Consider a linear forward diffusion with one-block kernel
+\begin{equation}
+q_{t\mid0}(\dd z\mid u)
+=
+\Normal
+\left(
+\dd z;
+\alpha_t\varphi(u),
+\sigma_t^2I_d
+\right),
+\qquad
+t\in[0,T].
+\label{eq:block-noise}
+\end{equation}
+We assume
+\begin{equation}
+\alpha_0=1,
+\quad
+\sigma_0=0,
+\quad
+\alpha_T=0,
+\quad
+\sigma_T=1.
+\label{eq:boundary-schedule}
+\end{equation}
+The $h$-block corruption kernel factorizes as
+\begin{equation}
+\boxed{
+q_{t\mid0}^{(h)}(\dd z_{0:h-1}\mid w)
+:=
+\prod_{j=0}^{h-1}
+q_{t\mid0}(\dd z_j\mid w_j).
+}
+\label{eq:blockwise-kernel}
+\end{equation}
+Let
+\begin{equation}
+m_{h,t}^{\targetpi}(\cdot\mid x)
+:=
+(\Diff_{h,t})_{\#}
+\mathbb M_h^{\targetpi}(\cdot\mid x)
+\label{eq:noisy-path-law}
+\end{equation}
+be the resulting noisy trajectory law.
+
+\subsection{The two Bellman branches at every noise level}
+
+Define the stopping probability path
+\begin{equation}
+\boxed{
+\begin{aligned}
+m_{h,t}^{\branchstop}(\dd z\mid x)
+:=
+\int
+\kappa_{\targetpi}(\dd y\mid x)
+q_{t\mid0}^{(h)}
+(\dd z\mid\stoptraj_h(y)).
+\end{aligned}
+}
+\label{eq:stop-path}
+\end{equation}
+Write $z=(z_0,z_+)\in\R^d\times\R^{(h-1)d}$. Define the continuation
+probability path
+\begin{equation}
+\boxed{
+\begin{aligned}
+m_{h,t}^{\branchcont}
+(\dd z_0,\dd z_+\mid x)
+:=
+\int
+\kappa_{\targetpi}(\dd y\mid x)
+q_{t\mid0}(\dd z_0\mid y)
+ m_{h-1,t}^{\targetpi}
+(\dd z_+\mid\nextx(y)).
+\end{aligned}
+}
+\label{eq:continue-path}
+\end{equation}
+For $h=1$, the suffix space is a singleton and the two paths coincide.
+
+\begin{theorem}[Trajectory Bellman probability path]
+\label{thm:path-mixture}
+For every $h\geq 1$, every conditioning pair $x$, and every diffusion time
+$t\in[0,T]$,
+\begin{equation}
+\boxed{
+ m_{h,t}^{\targetpi}(\cdot\mid x)
+ =
+ (1-\gamma)
+ m_{h,t}^{\branchstop}(\cdot\mid x)
+ +
+ \gamma
+ m_{h,t}^{\branchcont}(\cdot\mid x).
+}
+\label{eq:noise-bellman}
+\end{equation}
+At the clean endpoint,
+\begin{equation}
+m_{h,0}^{\targetpi}
+=
+(\Phi_h)_{\#}\mathbb M_h^{\targetpi}.
+\label{eq:clean-endpoint}
+\end{equation}
+At the source endpoint,
+\begin{equation}
+m_{h,T}^{\branchstop}
+=
+m_{h,T}^{\branchcont}
+=
+m_{h,T}^{\targetpi}
+=
+\Normal(0,I_{hd}).
+\label{eq:common-source}
+\end{equation}
+\end{theorem}
+
+\begin{proof}
+Substitute the path recursion in \cref{eq:path-bellman} into the pushforward
+in \cref{eq:noisy-path-law}. On the stopping branch this gives
+\cref{eq:stop-path}. On the continuation branch, blockwise corruption makes
+the noisy current token independent of the noisy suffix conditioned on the
+clean path. Integrating over the clean suffix gives
+$m_{h-1,t}^{\targetpi}$, which yields \cref{eq:continue-path}. At $t=T$,
+\cref{eq:boundary-schedule} makes every block standard Gaussian independently
+of its clean token. Both branches therefore share the same source.
+\end{proof}
+
+\begin{remark}[The source-boundary issue]
+A clean Bellman equation should not be copied mechanically to every noise
+level. The correct object is the time-dependent decomposition in
+\cref{eq:noise-bellman}. Each branch is transported through its own diffusion
+probability path, and the paths meet at the common Gaussian source. This is the
+trajectory analogue of the probability-path Bellman construction in Temporal
+Difference Flows.
+\end{remark}
+
+\section{Direct Bellmanization of the Reverse Score}
+\label{sec:score-learning}
+
+The reverse SDE associated with the forward process has drift
+\begin{equation}
+\dd Z_t
+=
+\left[
+ f(t)Z_t
+ -
+ g(t)^2\nabla_z\log m_{h,t}^{\targetpi}(Z_t\mid x)
+\right]\dd t
++
+g(t)\dd\overline W_t,
+\qquad
+t:T\downarrow0.
+\label{eq:reverse-sde}
+\end{equation}
+Thus direct trajectory generation reduces to learning the score of
+\cref{eq:noise-bellman}.
+
+\subsection{A mixture-score identity}
+
+\begin{lemma}[Score of a probability-path mixture]
+\label{lem:mixture-score}
+Let $p^0$ and $p^1$ be differentiable densities and
+$p=(1-\gamma)p^0+\gamma p^1$. Draw a branch
+$B\sim\operatorname{Bernoulli}(\gamma)$ and then draw $Z\sim p^B$. If
+$U^b(z)=\nabla_z\log p^b(z)$, then
+\begin{equation}
+\boxed{
+\arg\min_{s}
+\E\left[\|s(Z)-U^B(Z)\|_2^2\right]
+=
+\nabla_z\log p(z).
+}
+\label{eq:mixture-score-regression}
+\end{equation}
+The minimization is over all square-integrable vector fields.
+\end{lemma}
+
+\begin{proof}
+The population minimizer of squared regression is the conditional mean
+$\E[U^B(Z)\mid Z=z]$. Bayes' rule gives
+\begin{align}
+\E[U^B(Z)\mid Z=z]
+&=
+\frac{
+(1-\gamma)p^0(z)\nabla\log p^0(z)
++\gamma p^1(z)\nabla\log p^1(z)
+}{p(z)}
+\\
+&=
+\frac{\nabla p(z)}{p(z)}
+=
+\nabla\log p(z).
+\end{align}
+\end{proof}
+
+\subsection{Tractable component scores}
+
+For the stopping branch, sample
+\begin{equation}
+Y\sim\kappa_{\targetpi}(\cdot\mid X),
+\qquad
+Z^{\branchstop}_{0:h-1}
+\sim
+q_{t\mid0}^{(h)}
+(\cdot\mid\stoptraj_h(Y)).
+\label{eq:stop-sampling}
+\end{equation}
+Denoising score matching permits the conditional target
+\begin{equation}
+\boxed{
+U_{h,t}^{\branchstop}
+:=
+\nabla_z
+\log
+q_{t\mid0}^{(h)}
+\left(
+Z^{\branchstop}_{0:h-1}
+\mid
+\stoptraj_h(Y)
+\right).
+}
+\label{eq:stop-score-target}
+\end{equation}
+For the Gaussian kernel,
+\begin{equation}
+U_{h,t}^{\branchstop}
+=
+-
+\frac{1}{\sigma_t^2}
+\begin{pmatrix}
+Z_0^{\branchstop}-\alpha_t\varphi(Y)
+\\
+Z_1^{\branchstop}-\alpha_t\varphi(\emptytok)
+\\
+\vdots
+\\
+Z_{h-1}^{\branchstop}-\alpha_t\varphi(\emptytok)
+\end{pmatrix}.
+\label{eq:stop-gaussian-score}
+\end{equation}
+
+For the continuation branch, draw the same real token
+$Y\sim\kappa_{\targetpi}(\cdot\mid X)$ and set
+$X'=\nextx(Y)$. Draw
+\begin{equation}
+Z_0^{\branchcont}
+\sim
+q_{t\mid0}(\cdot\mid Y).
+\label{eq:cont-current-noise}
+\end{equation}
+The suffix is sampled directly from the frozen teacher probability path at the
+same noise level:
+\begin{equation}
+Z_+^{\branchcont}
+\sim
+m_{h-1,t}^{\Teacher}
+(\cdot\mid X').
+\label{eq:partial-reverse-suffix}
+\end{equation}
+Operationally, \cref{eq:partial-reverse-suffix} starts from Gaussian noise at
+$T$ and integrates the teacher reverse SDE only until $t$. It does not require
+generating a clean suffix and corrupting it again.
+
+Let
+\begin{equation}
+\score_{\Teacher,h-1}
+(z_+,t\mid x')
+\approx
+\nabla_{z_+}
+\log
+m_{h-1,t}^{\targetpi}(z_+\mid x')
+\end{equation}
+be the frozen suffix score. The continuation target is
+\begin{equation}
+\boxed{
+U_{h,t}^{\branchcont}
+:=
+\begin{pmatrix}
+\nabla_{z_0}
+\log q_{t\mid0}
+(Z_0^{\branchcont}\mid Y)
+\\[1mm]
+\sg\!
+\left[
+\score_{\Teacher,h-1}
+(Z_+^{\branchcont},t\mid X')
+\right]
+\end{pmatrix}.
+}
+\label{eq:continuation-score-target}
+\end{equation}
+The first block is analytic. The remaining blocks are bootstrapped at the same
+diffusion time from the previous horizon.
+
+\subsection{The single Bellman diffusion objective}
+
+Let
+\begin{equation}
+\score_{\Student,h}
+(z,t\mid x)
+\end{equation}
+be a trajectory score model. One transformer may be shared across all $h$ by
+using a horizon token and a variable-length attention mask. Define
+\begin{equation}
+\boxed{
+\begin{aligned}
+\mathcal L_h(\Student;\Teacher)
+:=
+\E_{X,t}
+\Big[
+&(1-\gamma)
+\E
+\left[
+\lambda(t)
+\left\|
+\score_{\Student,h}
+(Z^{\branchstop},t\mid X)
+-
+U_{h,t}^{\branchstop}
+\right\|_2^2
+\right]
+\\
+&+
+\gamma
+\E
+\left[
+\lambda(t)
+\left\|
+\score_{\Student,h}
+(Z^{\branchcont},t\mid X)
+-
+U_{h,t}^{\branchcont}
+\right\|_2^2
+\right]
+\Big].
+\end{aligned}
+}
+\label{eq:main-loss}
+\end{equation}
+Here $X$ is sampled from the dataset state-action distribution and
+$t\sim p_T$ is sampled from the diffusion training schedule. In practice, one
+samples a branch indicator and evaluates only its corresponding term.
+
+\begin{remark}[There is no auxiliary base loss]
+Equation~\eqref{eq:main-loss} is not a regularizer added to an ordinary
+diffusion objective. It is the denoising score-matching objective of the
+Bellman mixture itself. Removing either the stopping or continuation term
+changes the target probability path and therefore changes the generated clean
+law.
+\end{remark}
+
+\begin{theorem}[Population score backup]
+\label{thm:population-score-backup}
+Assume the frozen teacher is exact at horizon $h-1$:
+\begin{equation}
+\score_{\Teacher,h-1}(z,t\mid x)
+=
+\nabla_z\log m_{h-1,t}^{\targetpi}(z\mid x).
+\label{eq:exact-teacher}
+\end{equation}
+Then every population minimizer of \cref{eq:main-loss} satisfies
+\begin{equation}
+\boxed{
+\score_{\Student,h}^\star(z,t\mid x)
+=
+\nabla_z\log m_{h,t}^{\targetpi}(z\mid x)
+}
+\label{eq:exact-student-score}
+\end{equation}
+for almost every $(z,t,x)$.
+\end{theorem}
+
+\begin{proof}
+For the stopping branch, the denoising score-matching identity converts the
+conditional target in \cref{eq:stop-score-target} into the marginal score
+$\nabla\log m_{h,t}^{\branchstop}$. For the continuation branch, conditional
+on $(Y,X')$, the joint density factorizes as
+\begin{equation}
+q_{t\mid0}(z_0\mid Y)
+ m_{h-1,t}^{\targetpi}(z_+\mid X').
+\end{equation}
+Its score is exactly \cref{eq:continuation-score-target}. Marginalizing
+$(Y,X')$ therefore gives $\nabla\log m_{h,t}^{\branchcont}$. Applying
+\cref{lem:mixture-score} with the weights in \cref{eq:noise-bellman} yields
+\cref{eq:exact-student-score}.
+\end{proof}
+
+\section{Replay-Buffered Noisy Suffix Sampling}
+\label{sec:replay}
+
+The continuation law in \cref{eq:continue-path} requires a suffix sample from
+the teacher marginal at the same diffusion time. There are two exact
+population implementations when the teacher score and reverse solver are
+exact. One may partially integrate the teacher reverse SDE from $T$ to $t$, or
+one may generate a clean teacher suffix once, cache it, and independently
+corrupt it at each requested noise level.
+
+Let
+\begin{equation}
+\widehat{\mathbb M}_{\Teacher,h-1}(\cdot\mid x')
+\end{equation}
+denote the clean suffix law induced by a frozen teacher, and define its
+forward-corrupted marginal by
+\begin{equation}
+\widehat m_{\Teacher,h-1,t}(\cdot\mid x')
+:=
+(\Diff_{h-1,t})_{\#}
+\widehat{\mathbb M}_{\Teacher,h-1}(\cdot\mid x').
+\label{eq:teacher-forward-marginal}
+\end{equation}
+A replay entry stores the conditioning pair and the clean suffix:
+\begin{equation}
+(x',W_+),
+\qquad
+W_+\sim
+\widehat{\mathbb M}_{\Teacher,h-1}(\cdot\mid x').
+\label{eq:cached-suffix}
+\end{equation}
+
+\begin{proposition}[Replay equivalence]
+\label{prop:replay-equivalence}
+Conditioned on the same successor pair $x'$, draw a cached clean suffix as in
+\cref{eq:cached-suffix} and independently apply the blockwise corruption
+kernel at time $t$. Then
+\begin{equation}
+\boxed{
+Z_+
+\sim
+\widehat m_{\Teacher,h-1,t}(\cdot\mid x').
+}
+\label{eq:replay-equivalence}
+\end{equation}
+Consequently, clean-suffix replay gives exactly the same population
+continuation objective as sampling from the teacher forward probability path.
+If the teacher is an exact score model for that path and its reverse SDE is
+solved exactly, partial reverse integration to time $t$ has the same marginal
+and is equivalent as well.
+\end{proposition}
+
+\begin{proof}
+Equation~\eqref{eq:teacher-forward-marginal} is the pushforward of the clean
+teacher law through the independent blockwise corruption kernel. Sampling a
+clean suffix and applying that kernel is therefore sampling from the stated
+pushforward. Under score consistency and exact reverse integration, the
+teacher reverse process has these same marginals.
+\end{proof}
+
+\begin{remark}[What caching does and does not claim]
+\label{rem:caching-claim}
+The theory does not require avoiding clean suffix generation. Its substantive
+claim is that the Bellman path decomposition and score backup are defined
+exactly at every noise level. Replay is a computational implementation of that
+noise-level law. For continuous conditioning variables, a cached suffix must
+remain attached to the same sampled $x'=(s',a')$; nearest-neighbor reuse changes
+the conditional target and is an additional approximation.
+\end{remark}
+
+\section{Exact Recovery and Error Propagation}
+\label{sec:theory}
+
+\begin{assumption}[Population realizability]
+\label{ass:realizability}
+For every horizon $h\leq H$, the score model class contains
+$\nabla\log m_{h,t}^{\targetpi}(\cdot\mid x)$ for almost every $(t,x)$, the
+objective is minimized exactly, and the reverse SDE is solved exactly.
+\end{assumption}
+
+\begin{theorem}[Stagewise exact recovery]
+\label{thm:stagewise-recovery}
+Under \cref{ass:coverage,ass:realizability}, train horizons in the order
+$h=1,\ldots,H$, using the exact horizon-$(h-1)$ score as the frozen teacher.
+Then
+\begin{equation}
+\score_h(z,t\mid x)
+=
+\nabla_z\log m_{h,t}^{\targetpi}(z\mid x)
+\end{equation}
+for every $h\leq H$. Consequently, solving the horizon-$H$ reverse SDE from
+$\Normal(0,I_{Hd})$ returns
+\begin{equation}
+\boxed{
+W_H
+\sim
+\mathbb M_H^{\targetpi}(\cdot\mid X_0).
+}
+\label{eq:direct-generation-law}
+\end{equation}
+\end{theorem}
+
+\begin{proof}
+For $h=1$, the suffix is empty, and the stopping and continuation branches
+coincide with the one-token distribution. Its score is recovered by analytic
+denoising score matching. Suppose the claim holds for $h-1$. Theorem
+\ref{thm:population-score-backup} then gives the exact score at horizon $h$.
+Induction proves the score claim for all $h\leq H$. The reverse-time SDE theorem
+for score-based generative models then transports the common Gaussian source
+to the clean endpoint $(\Phi_H)_{\#}\mathbb M_H^{\targetpi}$.
+\end{proof}
+
+The stagewise construction differs from a generic fitted fixed-point iteration.
+The teacher depth is the trajectory suffix length. Each stage adds exactly one
+real evaluation-policy transition in front of the previously learned suffix.
+At inference, however, the full $H$-step tensor is produced by one reverse
+process.
+
+\subsection{Approximate stagewise fitting}
+
+For conditional laws on $\Wspace_h$, define
+\begin{equation}
+\|Q-Q'\|_{\TV,\infty}
+:=
+\sup_{x\in\Xspace}
+\TV(Q(\cdot\mid x),Q'(\cdot\mid x)).
+\end{equation}
+
+\begin{lemma}[Full-law stability]
+\label{lem:bellman-stability}
+For conditional suffix laws $Q,Q'$ on $\Wspace_{h-1}$,
+\begin{equation}
+\boxed{
+\|\Bell_h^{\targetpi}Q-\Bell_h^{\targetpi}Q'\|_{\TV,\infty}
+\leq
+\gamma
+\|Q-Q'\|_{\TV,\infty}.
+}
+\label{eq:bellman-tv-stability}
+\end{equation}
+\end{lemma}
+
+\begin{proof}
+The stopping branches are identical. The continuation branches differ only
+through the suffix laws, have total mass $\gamma$, and are obtained by
+integration and measurable pushforward, both of which are non-expansive in
+total variation.
+\end{proof}
+
+Let $\widehat{\mathbb M}_h$ be the clean law induced by the learned
+horizon-$h$ reverse process, with
+$\widehat{\mathbb M}_0=\mathbb M_0^{\targetpi}$. Define
+\begin{equation}
+\varepsilon_h^{\TV}
+:=
+\left\|
+\widehat{\mathbb M}_h
+-
+\Bell_h^{\targetpi}\widehat{\mathbb M}_{h-1}
+\right\|_{\TV,\infty}.
+\label{eq:tv-stage-error}
+\end{equation}
+
+\begin{theorem}[Full trajectory-law error]
+\label{thm:tv-error}
+For every $h\leq H$,
+\begin{equation}
+\boxed{
+\left\|
+\widehat{\mathbb M}_h-\mathbb M_h^{\targetpi}
+\right\|_{\TV,\infty}
+\leq
+\sum_{j=1}^{h}\gamma^{h-j}\varepsilon_j^{\TV}.
+}
+\label{eq:tv-error-bound}
+\end{equation}
+\end{theorem}
+
+\begin{proof}
+Apply the triangle inequality, \cref{lem:bellman-stability}, and the exact
+recursion
+$\mathbb M_h^{\targetpi}
+=\Bell_h^{\targetpi}\mathbb M_{h-1}^{\targetpi}$:
+\[
+\delta_h^{\TV}
+\leq
+\varepsilon_h^{\TV}
++
+\gamma\delta_{h-1}^{\TV}.
+\]
+Unrolling from $\delta_0^{\TV}=0$ gives
+\cref{eq:tv-error-bound}.
+\end{proof}
+
+\subsection{Return-sensitive seminorm}
+
+Full-law error is stronger than OPE requires. Define the undiscounted reward
+sum on a stopped path by
+\begin{equation}
+G_h(w)
+:=
+\sum_{t=0}^{L_h(w)-1}r(w_t),
+\qquad
+G_0(\varnothing):=0,
+\label{eq:return-functional}
+\end{equation}
+where $r(y)$ denotes the reward coordinate of token $y$. For a conditional law
+$Q$ on $\Wspace_h$, define
+\begin{equation}
+V_h^Q(x)
+:=
+\int G_h(w)Q(\dd w\mid x).
+\label{eq:law-value}
+\end{equation}
+For two conditional laws, define
+\begin{equation}
+\boxed{
+\|Q-Q'\|_{G,h}
+:=
+\sup_{x\in\Xspace}
+\left|
+V_h^Q(x)-V_h^{Q'}(x)
+\right|.
+}
+\label{eq:g-seminorm}
+\end{equation}
+This is a seminorm because distinct path laws may have the same expected
+reward sum.
+
+The path recursion implies
+\begin{equation}
+\boxed{
+V_h^{\Bell_h^{\targetpi}Q}(x)
+=
+\int\kappa_{\targetpi}(\dd y\mid x)
+\left[
+r(y)
++
+\gamma V_{h-1}^{Q}(\nextx(y))
+\right].
+}
+\label{eq:value-bellman-recursion}
+\end{equation}
+
+\begin{theorem}[Return-sensitive contraction]
+\label{thm:g-contraction}
+For any two conditional suffix laws $Q,Q'$,
+\begin{equation}
+\boxed{
+\|\Bell_h^{\targetpi}Q-\Bell_h^{\targetpi}Q'\|_{G,h}
+\leq
+\gamma\|Q-Q'\|_{G,h-1}.
+}
+\label{eq:g-contraction}
+\end{equation}
+\end{theorem}
+
+\begin{proof}
+The immediate reward in \cref{eq:value-bellman-recursion} is identical for
+$Q$ and $Q'$ and cancels. Taking absolute values and the supremum over $x$
+leaves $\gamma\|Q-Q'\|_{G,h-1}$.
+\end{proof}
+
+Define the value-sensitive stage error
+\begin{equation}
+\varepsilon_h^G
+:=
+\left\|
+\widehat{\mathbb M}_h
+-
+\Bell_h^{\targetpi}\widehat{\mathbb M}_{h-1}
+\right\|_{G,h}.
+\label{eq:g-stage-error}
+\end{equation}
+Equivalently,
+\begin{equation}
+\boxed{
+\varepsilon_h^G
+=
+\sup_x
+\left|
+\widehat V_h(x)
+-
+\int\kappa_{\targetpi}(\dd y\mid x)
+\left[
+r(y)+\gamma\widehat V_{h-1}(\nextx(y))
+\right]
+\right|,
+}
+\label{eq:g-bellman-residual}
+\end{equation}
+where $\widehat V_h:=V_h^{\widehat{\mathbb M}_h}$.
+
+\begin{theorem}[Return error propagation]
+\label{thm:g-error}
+Let
+\begin{equation}
+\delta_h^G
+:=
+\left\|
+\widehat{\mathbb M}_h-\mathbb M_h^{\targetpi}
+\right\|_{G,h}.
+\end{equation}
+Then
+\begin{equation}
+\boxed{
+\delta_h^G
+\leq
+\varepsilon_h^G+\gamma\delta_{h-1}^G,
+\qquad
+\delta_H^G
+\leq
+\sum_{h=1}^{H}\gamma^{H-h}\varepsilon_h^G.
+}
+\label{eq:g-error-bound}
+\end{equation}
+If $\varepsilon_h^G\leq\varepsilon^G$ for all $h$, then
+\begin{equation}
+\boxed{
+\delta_H^G
+\leq
+\frac{1-\gamma^H}{1-\gamma}\varepsilon^G.
+}
+\label{eq:g-uniform-bound}
+\end{equation}
+\end{theorem}
+
+\begin{proof}
+Use the triangle inequality, the exact path recursion, and
+\cref{thm:g-contraction}. This gives the one-step recursion in
+\cref{eq:g-error-bound}; repeated substitution and the finite geometric series
+give the remaining statements.
+\end{proof}
+
+\begin{remark}[Two levels of control]
+\label{rem:two-errors}
+Total variation controls the complete generated path law. The $G$-seminorm
+only controls conditional expected returns, but it gives the OPE quantity
+directly and avoids multiplying the final error by the maximum tensor length.
+Which error decreases or grows with horizon in finite models is an empirical
+question; \cref{thm:g-error} isolates the stagewise quantities that should be
+measured.
+\end{remark}
+
+\section{Training and Generation}
+\label{sec:algorithm}
+
+\subsection{Stagewise training}
+
+The exact theory uses one frozen teacher for each shorter suffix depth. The
+practical version may obtain the teacher noisy suffix either by partial reverse
+integration or by the replay equivalence in \cref{prop:replay-equivalence}.
+The latter amortizes expensive full teacher generations over many score
+updates.
+
+\begin{algorithm}[H]
+\caption{Bellman Path Diffusion Training with Suffix Replay}
+\label{alg:training}
+\begin{algorithmic}[1]
+\Require Offline transitions $\mathcal D$, evaluation policy $\targetpi$,
+discount $\gamma$, maximum capacity $H$, diffusion schedule, score network
+$\score_\theta(z,t\mid x,h)$
+\Ensure Horizon-$H$ trajectory score
+\State Define the horizon-$0$ suffix as the empty law
+\For{$h=1,\ldots,H$}
+    \State Freeze a target score $\score_{\Teacher,h-1}$ and its clean
+    horizon-$(h-1)$ reverse generator
+    \State Initialize a replay buffer $\mathcal R_{h-1}$ keyed by the exact
+    conditioning pair $x'$
+    \State Refresh $\mathcal R_{h-1}$ by sampling logged successors,
+    target actions, and clean teacher suffixes
+    \Repeat
+        \State Sample $(s,a,r,s')\sim\mathcal D$ and set $x\gets(s,a)$
+        \State Sample $a'\sim\targetpi(\cdot\mid s')$,
+        $x'\gets(s',a')$, and $y\gets(r,s',a')$
+        \State Sample a diffusion time $t$ and
+        $C\sim\operatorname{Bernoulli}(\gamma)$
+        \If{$C=0$ or $h=1$}
+            \State Set $w\gets\stoptraj_h(y)$
+            \State Sample $z\sim q_{t\mid0}^{(h)}(\cdot\mid w)$
+            \State Set
+            $u\gets\nabla_z\log q_{t\mid0}^{(h)}(z\mid w)$
+        \Else
+            \State Retrieve or generate
+            $w_+\sim
+            \widehat{\mathbb M}_{\Teacher,h-1}(\cdot\mid x')$
+            and keep it attached to this $x'$
+            \State Sample
+            $z_0\sim q_{t\mid0}(\cdot\mid y)$ and
+            $z_+\sim q_{t\mid0}^{(h-1)}(\cdot\mid w_+)$
+            \State Set
+            \[
+            z\gets(z_0,z_+),
+            \qquad
+            u\gets
+            \begin{pmatrix}
+            \nabla_{z_0}\log q_{t\mid0}(z_0\mid y)
+            \\
+            \sg[\score_{\Teacher,h-1}(z_+,t\mid x')]
+            \end{pmatrix}
+            \]
+        \EndIf
+        \State Update $\theta$ using
+        $\lambda(t)\|\score_\theta(z,t\mid x,h)-u\|_2^2$
+    \Until{the horizon-$h$ training budget is exhausted}
+    \State Freeze or EMA-copy the horizon-$h$ score for the next stage
+\EndFor
+\State \Return $\score_\theta(\cdot,\cdot\mid\cdot,H)$
+\end{algorithmic}
+\end{algorithm}
+
+\begin{remark}[Shared network implementation]
+The mathematical description uses a score family indexed by $h$. A single
+variable-length transformer may share parameters across depths using a horizon
+embedding and an attention mask. The stagewise theorem is the clean population
+reference point; EMA targets and mixed-depth minibatches are two-timescale
+approximations.
+\end{remark}
+
+\subsection{Direct generation and OPE}
+
+After training, draw
+\begin{equation}
+S_0\sim\mu_0,
+\qquad
+A_0\sim\targetpi(\cdot\mid S_0),
+\qquad
+X_0=(S_0,A_0).
+\end{equation}
+Initialize
+\begin{equation}
+Z_T\sim\Normal(0,I_{Hd})
+\end{equation}
+and solve the horizon-$H$ reverse SDE in \cref{eq:reverse-sde}. Decode the
+clean endpoint into $W_H\in\Wspace_H$ and remove all blocks after the first
+padding token.
+
+\begin{algorithm}[H]
+\caption{Direct Evaluation-Policy Trajectory Generation}
+\label{alg:generation}
+\begin{algorithmic}[1]
+\Require Initial distribution $\mu_0$, evaluation policy $\targetpi$,
+trained horizon-$H$ score, reverse solver
+\State Sample $s_0\sim\mu_0$ and $a_0\sim\targetpi(\cdot\mid s_0)$
+\State Sample $z_T\sim\Normal(0,I_{Hd})$
+\State Solve the reverse SDE from $T$ to $0$ conditioned on
+$x_0=(s_0,a_0)$
+\State Decode $w_H\gets\Phi_H^{-1}(z_0)$
+\State Remove all blocks after the first padding token
+\State \Return the generated reward-bearing trajectory
+\end{algorithmic}
+\end{algorithm}
+
+Generate $M$ independent trajectories and estimate
+\begin{equation}
+\boxed{
+\widehat J_H(\targetpi)
+:=
+\frac{1}{M}
+\sum_{m=1}^M
+\sum_{t=0}^{L_H(W_H^{(m)})-1}
+R_t^{(m)}.
+}
+\label{eq:ope-estimator}
+\end{equation}
+No explicit factor $\gamma^t$ is required in the estimator because geometric
+survival already implements discounting.
+
+\begin{corollary}[Exact and approximate OPE]
+\label{cor:ope}
+Under the assumptions of \cref{thm:stagewise-recovery},
+\begin{equation}
+\E[\widehat J_H(\targetpi)]
+=
+J_H(\targetpi)
+:=
+\E_{\targetpi}
+\left[
+\sum_{t=0}^{H-1}\gamma^tR_t
+\right].
+\label{eq:exact-ope}
+\end{equation}
+More generally, let
+\begin{equation}
+\overline J_H(\targetpi)
+:=
+\E_{\substack{
+X_0\sim\mu_0\targetpi\\
+W_H\sim\widehat{\mathbb M}_H(\cdot\mid X_0)
+}}
+[G_H(W_H)].
+\end{equation}
+Then
+\begin{equation}
+\boxed{
+|\overline J_H(\targetpi)-J_H(\targetpi)|
+\leq
+\delta_H^G
+\leq
+\sum_{h=1}^{H}\gamma^{H-h}\varepsilon_h^G.
+}
+\label{eq:approx-ope}
+\end{equation}
+If $|R_t|\leq R_{\max}$ and
+$J(\targetpi)=\E_{\targetpi}[\sum_{t=0}^{\infty}\gamma^tR_t]$, then
+\begin{equation}
+\boxed{
+|\overline J_H(\targetpi)-J(\targetpi)|
+\leq
+\sum_{h=1}^{H}\gamma^{H-h}\varepsilon_h^G
++
+\frac{\gamma^H R_{\max}}{1-\gamma}.
+}
+\label{eq:infinite-ope}
+\end{equation}
+\end{corollary}
+
+\begin{proof}
+Exactness follows from \cref{prop:path-semantics,thm:stagewise-recovery}.
+The first approximate bound is the definition of the $G$-seminorm averaged
+over the initial state-action law, followed by \cref{thm:g-error}. The
+infinite-horizon result adds the usual truncation tail.
+\end{proof}
+
+\section{Relationship to Temporal Difference Flows}
+\label{sec:relationship}
+
+The proposed method takes one specific technical idea from Temporal Difference
+Flows: a Bellman decomposition can be lifted from the clean endpoint to the
+complete generative probability path, and component vector fields or scores can
+be bootstrapped directly. In the diffusion extension of
+\citet{farebrother2025tdflow}, TD$^2$-DD uses an analytic score for the
+one-step branch and the frozen score of the bootstrapped successor-state path
+for the continuation branch. Our method preserves this construction exactly,
+but changes the generated object and the continuation geometry.
+
+The source method generates one geometrically sampled future state. We generate
+a complete sequence of transition tokens. The continuation branch therefore
+factorizes into
+\begin{equation}
+\boxed{
+\text{analytic noisy current token}
+\quad\oplus\quad
+\text{teacher noisy future suffix}.
+}
+\end{equation}
+This factorization is what makes trajectory generation possible without clean
+pseudo-trajectories. It also produces a finite-depth induction: horizon $h$
+uses horizon $h-1$ as its teacher, while a single horizon-$H$ reverse process
+is used at inference.
+
+The posterior-mean temporal-difference objective of
+\citet{ying2026tddiffusion} is orthogonal. It improves consistency between two
+noise levels for a known clean data distribution. It is not needed to define
+the Bellman target distribution here, so we omit it from the core objective.
+It may be added later as a solver-consistency regularizer, but it should not be
+part of the correctness argument.
+
+\section{Discussion}
+\label{sec:discussion}
+
+\paragraph{Why the framework is not a plug-in correction.}
+The evaluation policy enters the one-step token kernel in
+\cref{eq:token-kernel}. The Bellman stop and continuation branches define the
+training distribution at every noise level through \cref{eq:noise-bellman}.
+The resulting score is the field used by the ordinary reverse SDE. There is no
+classifier guidance, density-ratio multiplier, behavior-policy correction, or
+Bellman residual added during sampling.
+
+\paragraph{Why complete trajectories matter.}
+A successor-state model can evaluate rewards that are functions of one future
+state. A reward-bearing path model preserves transition rewards, action
+sequences, termination, cumulative costs, hitting events, and other path
+functionals. Direct generation also avoids repeated calls to a learned
+one-step world model at inference.
+
+\paragraph{Frozen methodological scope.}
+The core method consists only of the path recursion, blockwise corruption, the
+two branch score targets, and stagewise suffix bootstrapping. Occupancy-ratio
+estimation, Doob transforms, Schr\"odinger bridges, and sampling-time policy
+guidance are outside this framework.
+
+\paragraph{Main limitations.}
+The method requires conditional support for state-action pairs reached by the
+evaluation policy. Partial reverse teacher sampling adds training cost, and the
+trajectory dimension grows linearly with $H$. Exact discrete token decoding is
+also nontrivial when states or actions are categorical. These are
+implementation and approximation challenges; they do not alter the
+probability-path identity.
+
+\paragraph{Empirical priorities.}
+The first diagnostic is the generated length law in \cref{eq:length-law},
+including the censored mass at $H$. The second is blockwise trajectory
+validity under $P^\star$ and $\targetpi$. The third measures
+$\varepsilon_h^{\TV}$ and $\varepsilon_h^G$ as functions of $h$ to determine
+whether practical suffix errors are attenuated or accumulated. Replay and
+partial reverse sampling should also be compared for computational cost and
+finite-model mismatch, even though they are population-equivalent under the
+conditions of \cref{prop:replay-equivalence}.
+
+\section{Complete Operator Chain}
+\label{sec:summary}
+
+The complete construction is
+\begin{equation}
+\boxed{
+\begin{aligned}
+&Y=(R,S',A'),
+\qquad
+Y\sim P^\star(\dd r,\dd s'\mid S,A)
+\targetpi(\dd a'\mid S')
+\\[1mm]
+&\Downarrow
+\\[-1mm]
+&\mathbb M_h^{\targetpi}
+=
+\Bell_h^{\targetpi}\mathbb M_{h-1}^{\targetpi}
+\\[1mm]
+&\Downarrow
+\\[-1mm]
+&m_{h,t}^{\targetpi}
+=
+(1-\gamma)m_{h,t}^{\branchstop}
++
+\gamma m_{h,t}^{\branchcont}
+\qquad\forall t
+\\[1mm]
+&\Downarrow
+\\[-1mm]
+&U_{h,t}^{\branchstop}
+=
+\text{analytic full-path score},
+\qquad
+U_{h,t}^{\branchcont}
+=
+\begin{pmatrix}
+\text{analytic current-token score}
+\\
+\text{teacher suffix score at time }t
+\end{pmatrix}
+\\[1mm]
+&\Downarrow
+\\[-1mm]
+&\score_h^\star(z,t\mid x)
+=
+\nabla_z\log m_{h,t}^{\targetpi}(z\mid x)
+\\[1mm]
+&\Downarrow
+\\[-1mm]
+&Z_T\sim\Normal(0,I)
+\xrightarrow{\text{one reverse diffusion}}
+W_H\sim\mathbb M_H^{\targetpi}
+\\[1mm]
+&\Downarrow
+\\[-1mm]
+&\E\left[\sum_{t<L_H(W_H)}R_t\right]
+=
+\E_{\targetpi}\left[\sum_{t=0}^{H-1}\gamma^tR_t\right].
+\end{aligned}
+}
+\label{eq:complete-chain}
+\end{equation}
+
+\appendix
+
+\section{Derivation from the Fokker-Planck Equation}
+\label{app:fokker-planck}
+
+For completeness, consider two diffusion processes with a shared diffusion
+coefficient $g(t)$ and marginal densities $p_t^0,p_t^1$:
+\begin{equation}
+\dd Z_t=b_t^i(Z_t)\dd t+g(t)\dd W_t,
+\qquad i\in\{0,1\}.
+\end{equation}
+Their Fokker-Planck equations are
+\begin{equation}
+\partial_t p_t^i
+=-\nabla\cdot(p_t^i b_t^i)
++\frac{g(t)^2}{2}\Delta p_t^i.
+\end{equation}
+For $p_t=(1-\gamma)p_t^0+\gamma p_t^1$,
+\begin{equation}
+\partial_t p_t
+=-\nabla\cdot
+\left(
+(1-\gamma)p_t^0b_t^0
++\gamma p_t^1b_t^1
+\right)
++\frac{g(t)^2}{2}\Delta p_t.
+\end{equation}
+Hence the mixture path is generated by the drift
+\begin{equation}
+b_t(z)
+=
+\frac{
+(1-\gamma)p_t^0(z)b_t^0(z)
++\gamma p_t^1(z)b_t^1(z)
+}{
+(1-\gamma)p_t^0(z)+\gamma p_t^1(z)
+}.
+\end{equation}
+For reverse diffusions with the same forward drift and diffusion coefficient,
+this reduces to the mixture-score formula in \cref{lem:mixture-score}. This is
+the diffusion mechanism behind TD$^2$-DD and behind
+\cref{eq:main-loss}.
+
+\section{Detailed Proof of the Continuation Score}
+\label{app:continuation-score}
+
+Fix $x$ and write $x'=\nextx(y)$. Conditional on $Y=y$, the continuation
+marginal is
+\begin{equation}
+p_t(z_0,z_+\mid y,x)
+=
+q_{t\mid0}(z_0\mid y)
+ m_{h-1,t}^{\targetpi}(z_+\mid x').
+\end{equation}
+Therefore,
+\begin{equation}
+\nabla_{(z_0,z_+)}\log p_t(z_0,z_+\mid y,x)
+=
+\begin{pmatrix}
+\nabla_{z_0}\log q_{t\mid0}(z_0\mid y)
+\\
+\nabla_{z_+}\log m_{h-1,t}^{\targetpi}(z_+\mid x')
+\end{pmatrix}.
+\end{equation}
+Let
+\begin{equation}
+p_t^{\branchcont}(z\mid x)
+=
+\int\kappa_{\targetpi}(\dd y\mid x)
+p_t(z\mid y,x).
+\end{equation}
+The conditional score identity gives
+\begin{equation}
+\nabla_z\log p_t^{\branchcont}(z\mid x)
+=
+\E
+\left[
+\nabla_z\log p_t(z\mid Y,x)
+\middle|
+Z=z,X=x,\text{continuation}
+\right].
+\end{equation}
+Thus the target in \cref{eq:continuation-score-target} is an unbiased
+conditional score target for the continuation marginal whenever the teacher is
+exact.
+
+\section{Discrete DDPM Parameterization}
+\label{app:ddpm}
+
+For a discrete DDPM schedule, let
+\begin{equation}
+Z_t
+=
+\sqrt{\bar\alpha_t}\,\Phi_h(W)
++
+\sqrt{1-\bar\alpha_t}\,\epsilon,
+\qquad
+\epsilon\sim\Normal(0,I).
+\end{equation}
+The analytic token score is
+\begin{equation}
+\nabla_{z_t}
+\log q_t(z_t\mid W)
+=
+-
+\frac{
+ z_t-\sqrt{\bar\alpha_t}\,\Phi_h(W)
+}{1-\bar\alpha_t}.
+\end{equation}
+Equivalently, a noise-prediction network may be trained. On the stopping branch,
+the target is the sampled Gaussian noise. On the continuation branch, the
+current-token target is its sampled noise, while the suffix target is the
+teacher's noise prediction at the same discrete time index. The resulting loss
+is the trajectory counterpart of the TD$^2$-DD implementation in
+\citet{farebrother2025tdflow}.
+
+\section{Practical Variant with EMA Targets}
+\label{app:ema}
+
+The exact analysis freezes a horizon-$(h-1)$ teacher while fitting horizon $h$.
+A practical implementation may use one shared network and an EMA target. Let
+$\theta$ be the online parameters and $\bar\theta$ the target parameters. A
+curriculum distribution $p(h)$ first concentrates on short horizons and then
+expands toward $H$. For a sampled horizon $h$, the continuation target queries
+$\score_{\bar\theta}(z_+,t\mid x',h-1)$. After each update,
+\begin{equation}
+\bar\theta
+\leftarrow
+\zeta\bar\theta+(1-\zeta)\theta.
+\end{equation}
+This replaces exact stage boundaries by a two-timescale approximation. The
+stagewise theorem remains the clean population reference point.
+
+\begin{thebibliography}{9}
+
+\bibitem[Farebrother et al.(2025)]{farebrother2025tdflow}
+Jesse Farebrother, Matteo Pirotta, Andrea Tirinzoni, R\'emi Munos,
+Alessandro Lazaric, and Ahmed Touati.
+\newblock Temporal Difference Flows.
+\newblock In \emph{Proceedings of the 42nd International Conference on
+Machine Learning}, 2025.
+
+\bibitem[Ho et al.(2020)]{ho2020ddpm}
+Jonathan Ho, Ajay Jain, and Pieter Abbeel.
+\newblock Denoising Diffusion Probabilistic Models.
+\newblock In \emph{Advances in Neural Information Processing Systems}, 2020.
+
+\bibitem[Janner et al.(2020)]{janner2020gamma}
+Michael Janner, Igor Mordatch, and Sergey Levine.
+\newblock Gamma-Models: Generative Temporal Difference Learning for
+Infinite-Horizon Prediction.
+\newblock In \emph{Advances in Neural Information Processing Systems}, 2020.
+
+\bibitem[Song et al.(2021)]{song2021sde}
+Yang Song, Jascha Sohl-Dickstein, Diederik P. Kingma, Abhishek Kumar,
+Stefano Ermon, and Ben Poole.
+\newblock Score-Based Generative Modeling through Stochastic Differential
+Equations.
+\newblock In \emph{International Conference on Learning Representations},
+2021.
+
+\bibitem[Vincent(2011)]{vincent2011score}
+Pascal Vincent.
+\newblock A Connection Between Score Matching and Denoising Autoencoders.
+\newblock \emph{Neural Computation}, 23(7):1661--1674, 2011.
+
+\bibitem[Ying et al.(2026)]{ying2026tddiffusion}
+Qizhen Ying, Yangchen Pan, Victor Adrian Prisacariu, and Junfeng Wen.
+\newblock Temporal Difference Learning for Diffusion Models.
+\newblock In \emph{Proceedings of the 43rd International Conference on
+Machine Learning}, 2026.
+
+\end{thebibliography}
+
+\end{document}

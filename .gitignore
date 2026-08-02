@@ -9,6 +9,8 @@ __pycache__/
 .venv/
 venv/
 env/
+.deps/
+.cache/
 
 # Distribution / packaging
 *.egg-info/
@@ -31,8 +33,11 @@ wandb/
 *.pth
 *.ckpt
 
-# Datasets
-data/
+# Datasets (root only; do not ignore the bpd/data source package)
+/data/
+
+# Local shallow clones used only for implementation research
+references/
 
 # Editor / OS artifacts
 .DS_Store
