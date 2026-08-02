@@ -36,6 +36,7 @@ from bpd.core.path import (
     sample_path_length,
     encode_token,
     token_dim,
+    PAD_FLAG,
 )
 
 
@@ -84,12 +85,17 @@ class TestStopMap:
         w, _ = stop_map(y, h)
         assert torch.allclose(w[0], y.float()), "w[0] should equal y"
 
-    def test_padding_positions_are_zero(self):
-        """Positions 1..h-1 must be the zero padding token."""
+    def test_padding_positions_are_padding_token(self):
+        """Positions 1..h-1 must be φ(⊥) = (0,...,0, PAD_FLAG) (injective φ)."""
         h = 5
         y = random_token(4)
         w, _ = stop_map(y, h)
-        assert torch.all(w[1:] == 0.0), "Padding tokens must be all-zero"
+        # All non-flag coordinates are zero.
+        assert torch.all(w[1:, :-1] == 0.0), "Padding non-flag coords must be zero"
+        # The flag coordinate marks padding (PAD_FLAG = -1), making φ injective.
+        assert torch.all(w[1:, -1] == PAD_FLAG), "Padding flag coord must be PAD_FLAG"
+        # A padding token is distinct from the real token y (injectivity).
+        assert not torch.allclose(w[1], y.float())
 
     def test_pad_mask_first_false(self):
         """Position 0 is a real token: pad_mask[0] must be False."""

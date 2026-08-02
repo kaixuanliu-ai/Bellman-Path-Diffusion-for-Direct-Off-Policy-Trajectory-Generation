@@ -229,7 +229,7 @@ def _build_model(
     """
     obs_dim: int = int(config["obs_dim"])
     act_dim: int = int(config["act_dim"])
-    token_dim: int = 1 + obs_dim + act_dim
+    token_dim: int = 2 + obs_dim + act_dim  # reward + obs + act + injective-phi flag
     max_horizon: int = int(config.get("max_horizon", 8))
 
     model_cfg: Dict[str, Any] = config.get("model", {})
@@ -707,7 +707,7 @@ def main(argv: Optional[List[str]] = None) -> None:
     act_dim: int = int(config["act_dim"])
     gamma: float = float(config.get("gamma", 0.99))
     max_horizon: int = int(config.get("max_horizon", 8))
-    token_dim_val: int = 1 + obs_dim + act_dim
+    token_dim_val: int = 2 + obs_dim + act_dim  # reward + obs + act + injective-phi flag
 
     logger.info(
         "Config: env=%s  obs_dim=%d  act_dim=%d  gamma=%.4f  H=%d",

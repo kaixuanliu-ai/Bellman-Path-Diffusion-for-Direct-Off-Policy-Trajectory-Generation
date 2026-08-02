@@ -36,21 +36,34 @@ directory. No reference repository is vendored into this project.
 | Diffuser, ICML 2022 | [jannerm/diffuser](https://github.com/jannerm/diffuser), `7ea422860cc0106e5ca5949d980f04b799d5462c` | separation of `q_sample`, posterior/reverse sampling, EMA training lifecycle, field normalization boundaries | MIT |
 | Score-SDE, ICLR 2021 Oral | [yang-song/score_sde_pytorch](https://github.com/yang-song/score_sde_pytorch), `cb1f359f4aadf0ff9a5e122fe8fffc9451fd6e44` | score/epsilon conversion and stop-gradient reverse-SDE organization | Apache-2.0 |
 | DiT, ICCV 2023 | [facebookresearch/DiT](https://github.com/facebookresearch/DiT), `ed81ce2229091fd4ecc9a223645f95cf379d582b` | adaLN-Zero gating and zero-initialized final projection | CC-BY-NC; consulted as an architectural reference, not vendored |
-| Temporal Difference Flows, ICML 2025 | [paper](https://arxiv.org/abs/2503.09817) and its published pseudocode | probability-path Bellman branching and frozen target field | no official public code repository was discoverable during this audit |
+| DDPM, NeurIPS 2020 | [hojonathanho/diffusion](https://github.com/hojonathanho/diffusion), `1e0dceb3b3495bbe19116a5e1b3596cd0706c543` | original discrete DDPM forward/posterior parameterization (`ho2020ddpm`) | MIT; consulted, not vendored |
+| Gamma-Models, NeurIPS 2020 | [JannerM/gamma-models](https://github.com/JannerM/gamma-models), `bb23e06753717a9255065355b5f6ab77278f3305` | geometric-horizon / discounted-future sampling and geometric survival (`janner2020gamma`), the predecessor of the geometric stopping in Eq. 14-15 | MIT; consulted, not vendored |
+| Temporal Difference Flows, ICML 2025 | [paper](https://arxiv.org/abs/2503.09817) and its published pseudocode | probability-path Bellman branching and frozen target field | no official public code repository was discoverable during this audit (arXiv, OpenReview, ICML v267 proceedings, and author/org GitHub all checked) |
 
 ## Approximation and validation boundaries
 
 - The exact recovery theorem assumes realizability, population optimization,
   an exact teacher, and exact reverse integration. The implementation uses a
   finite network, SGD, EMA snapshots, and a finite DDPM solver.
-- Standard finite DDPM schedules make the terminal marginal numerically close
-  to, rather than symbolically equal to, `N(0,I)`.
+- Source boundary `alpha_T = 0, sigma_T = 1` (paper.tex L409) is now enforced
+  **exactly**: `DDPMSchedule` applies a zero-terminal-SNR rescaling of
+  `sqrt(alphabar_t)` (Lin et al. 2024, "Common Diffusion Noise Schedules and
+  Sample Steps are Flawed", Algorithm 1) so the terminal marginal is
+  symbolically `N(0,I)`, not merely numerically close. Enabled by default via
+  `zero_terminal_snr=True`. Note: with epsilon-prediction the terminal x0
+  estimate is amplified by `1/alpha_T`; sampling relies on the standard x0
+  handling (a well-trained net predicts eps≈z_T at t=T, cancelling to ≈0), and
+  `clip_denoised` remains available for normalized-token runs.
+- The token map `phi` is now **injective by construction** (paper.tex L384):
+  each token carries a trailing flag coordinate, `+1` for a real token and
+  `-1` for the padding token `phi(bottom) = (0,...,0,-1)`. Decoding is the
+  exact inverse `Phi_h^{-1}` — a slot is padding iff its flag coordinate is
+  negative — replacing the earlier `||token|| < threshold` heuristic under
+  which a near-zero real transition could be misread as padding. This makes
+  `d_tok = 2 + obs_dim + act_dim`.
 - Clean-suffix replay is exact only conditional on the same float32 `(s',a')`.
   Rounded or nearest-neighbor replay is disabled by default. A finite cached
   sample reused across updates remains a finite-sample approximation.
-- Continuous zero-padding is decoded by distance to the reserved padding
-  embedding. This is a practical decoder, not a proof of exact inversion of
-  `Phi_h`; the paper itself identifies exact discrete decoding as nontrivial.
 - Coverage of every evaluation-policy state-action pair cannot be established
   from software alone. Training/evaluation must report a coverage diagnostic
   for each dataset-policy pair.

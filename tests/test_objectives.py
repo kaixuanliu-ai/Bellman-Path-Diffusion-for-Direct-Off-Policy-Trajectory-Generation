@@ -12,7 +12,8 @@ from bpd.utils.arrays import DataBatch
 
 OBS_DIM = 3
 ACT_DIM = 2
-TOKEN_DIM = 1 + OBS_DIM + ACT_DIM
+# d_tok = reward + obs + act + injective-phi flag (bpd.core.path.token_dim).
+TOKEN_DIM = 2 + OBS_DIM + ACT_DIM
 
 
 def make_batch(batch_size: int = 8) -> DataBatch:
@@ -98,11 +99,13 @@ def test_evaluation_policy_action_defines_token_and_successor_condition() -> Non
         noise=torch.zeros(2, 1, TOKEN_DIM),
     )
     torch.testing.assert_close(target.successor_conditioning[:, -ACT_DIM:], next_action)
+    # Token layout is [r, s', a', flag]; the action occupies these coordinates.
+    act_slice = slice(1 + OBS_DIM, 1 + OBS_DIM + ACT_DIM)
     # With zero noise, recover the clean token from z_t / alpha_t.
     alpha = objective.diffusion.sqrt_alphas_bar[1]
     recovered = target.z_t[:, 0] / alpha
-    torch.testing.assert_close(recovered[:, -ACT_DIM:], next_action)
-    assert not torch.allclose(recovered[:, -ACT_DIM:], batch.action)
+    torch.testing.assert_close(recovered[:, act_slice], next_action)
+    assert not torch.allclose(recovered[:, act_slice], batch.action)
 
 
 def test_horizon_one_collapses_both_branches_to_stop() -> None:

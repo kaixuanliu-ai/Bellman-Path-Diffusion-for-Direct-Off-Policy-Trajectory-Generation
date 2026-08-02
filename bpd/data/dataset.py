@@ -31,6 +31,7 @@ import numpy as np
 import torch
 import torch.utils.data
 
+from bpd.core.path import encode_token
 from bpd.utils.arrays import DataBatch, to_torch
 
 logger = logging.getLogger(__name__)
@@ -347,8 +348,9 @@ class TransitionDataset(torch.utils.data.Dataset):
                             the dataset's normalisation.
 
         Returns:
-            Token tensor  y  of shape  ``(1 + obs_dim + act_dim,)``  with
-            layout  ``[r | s'_0 ... s'_{obs_dim-1} | a'_0 ... a'_{act_dim-1}]``.
+            Token tensor  y  of shape  ``(2 + obs_dim + act_dim,)``  with
+            layout ``[r | s' | a' | flag]`` where the trailing coordinate is the
+            injective-φ real-token flag (:data:`bpd.core.path.REAL_FLAG`).
 
         Raises:
             ValueError: If no evaluation policy is available.
@@ -375,9 +377,8 @@ class TransitionDataset(torch.utils.data.Dataset):
             -1
         )
 
-        # y = [r, s', a']  – Eq. 7
-        token = torch.cat([reward, next_state, next_action], dim=0)
-        return token
+        # y = φ([r, s', a']) with trailing REAL_FLAG – Eq. 7 (injective φ)
+        return encode_token(reward, next_state, next_action)
 
     # ------------------------------------------------------------------
     # Convenience properties

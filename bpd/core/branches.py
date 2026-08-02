@@ -19,6 +19,7 @@ from typing import Callable, Optional
 import torch
 from torch import Tensor
 
+from bpd.core.path import PAD_FLAG
 from bpd.models.diffusion import BlockwiseDiffusion
 
 TeacherNoiseFn = Callable[[Tensor, Tensor, Tensor, int], Tensor]
@@ -59,7 +60,10 @@ class StopBranch:
         if t.shape != (batch_size,):
             raise ValueError(f"t must have shape ({batch_size},), got {tuple(t.shape)}")
 
+        # stop_h(y) = (y, ⊥, ..., ⊥): mark every slot as padding φ(⊥) via the
+        # flag coordinate, then place the real token y in slot 0.
         clean_path = y.new_zeros(batch_size, h, token_dim)
+        clean_path[..., -1] = PAD_FLAG
         clean_path[:, 0] = y
         if noise is None:
             noise = torch.randn_like(clean_path)

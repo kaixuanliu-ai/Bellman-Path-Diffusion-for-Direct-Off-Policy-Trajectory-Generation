@@ -15,6 +15,7 @@ import torch.nn as nn
 from torch import Tensor
 
 from bpd.core.branches import ContinueBranch, StopBranch, TeacherNoiseFn
+from bpd.core.path import append_real_flag
 from bpd.data.replay import SuffixReplayBuffer
 from bpd.models.diffusion import BlockwiseDiffusion, DDPMSchedule
 from bpd.utils.arrays import DataBatch
@@ -151,7 +152,10 @@ class BellmanDiffusionLoss(nn.Module):
             raise ValueError("next_action batch size does not match transitions")
 
         next_action = next_action.to(device=state.device, dtype=state.dtype)
-        y = torch.cat((reward.to(state), next_state.to(state), next_action), dim=-1)
+        # y = φ((r, s', a')) with the trailing REAL_FLAG coordinate (injective φ).
+        y = append_real_flag(
+            torch.cat((reward.to(state), next_state.to(state), next_action), dim=-1)
+        )
         if y.shape[-1] != self.token_dim:
             raise ValueError(
                 f"token has dimension {y.shape[-1]}, expected {self.token_dim}"

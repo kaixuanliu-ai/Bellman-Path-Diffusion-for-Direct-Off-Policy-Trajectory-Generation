@@ -31,7 +31,7 @@ Key results implemented:
 Shapes used throughout (consistent with the rest of the codebase):
     B          – batch size
     H          – maximum path horizon
-    token_dim  – d_tok = 1 + obs_dim + act_dim
+    token_dim  – d_tok = 2 + obs_dim + act_dim (reward + obs + act + flag)
     T          – total diffusion timesteps
 """
 
@@ -44,6 +44,7 @@ import numpy as np
 import torch
 from torch import Tensor
 
+from bpd.core.path import PAD_THRESHOLD
 from bpd.models.diffusion import BlockwiseDiffusion
 
 logger = logging.getLogger(__name__)
@@ -188,7 +189,8 @@ class OPEEvaluator:
         self.H: int = int(config["horizon"])
         self.obs_dim: int = int(config["obs_dim"])
         self.act_dim: int = int(config["act_dim"])
-        self.token_dim: int = 1 + self.obs_dim + self.act_dim
+        # d_tok = reward + next_obs + next_action + injective-φ flag.
+        self.token_dim: int = 2 + self.obs_dim + self.act_dim
 
         self.gamma: float = float(config.get("gamma", 0.99))
         self.norm_threshold: float = float(config.get("norm_threshold", 0.3))
@@ -199,7 +201,7 @@ class OPEEvaluator:
         if self.diffusion.token_dim != self.token_dim:
             raise ValueError(
                 f"diffusion.token_dim={self.diffusion.token_dim} does not match "
-                f"1 + obs_dim + act_dim = {self.token_dim} from config."
+                f"2 + obs_dim + act_dim = {self.token_dim} from config."
             )
 
     # -----------------------------------------------------------------------
@@ -474,24 +476,22 @@ class OPEEvaluator:
 
         tokens = z  # (h, token_dim); already denoised
 
-        # --- Padding detection heuristic ---
-        # Padding tokens are encoded as zero vectors; after the reverse chain
-        # they are approximately near zero in full token space.
-        token_norms = tokens.norm(dim=-1)  # (h,)
-        is_padding = token_norms < self.norm_threshold
+        # --- Exact flag-based decode (Φ_H^{-1}, paper.tex L384) ---
+        # Every real token carries flag = +1 in its last coordinate; the padding
+        # token φ(⊥) carries flag = -1.  A slot is padding iff its flag is
+        # negative.  This is the exact inverse on clean tokens and replaces the
+        # earlier ‖token‖ < threshold heuristic (which could misread a near-zero
+        # real transition as padding).
+        is_padding = tokens[:, -1] < PAD_THRESHOLD  # (h,)
 
-        # BPD paths have a suffix structure: find the first padding position and
-        # mark everything from that point on as padding.
-        is_real = ~is_padding  # (h,) initial guess
-        # Every Bellman path contains its current transition (Eq. 6), even if
-        # that transition's numeric token happens to be close to zero.
+        is_real = ~is_padding
+        # Every Bellman path contains its current transition (Eq. 6): slot 0 is
+        # real by construction regardless of the generated flag value.
         if h > 0:
             is_real[0] = True
 
-        # Enforce prefix-real / suffix-padding invariant (Eq. 4-5):
-        # once is_real[j] = False, all subsequent positions must also be False.
-        # We do this efficiently with a cumulative AND.
-        # cumulative_real[j] = True iff is_real[0..j] are all True.
+        # Enforce prefix-real / suffix-padding invariant (Eq. 4-5): once a slot
+        # is padding, all subsequent slots are padding.
         if h > 0:
             cumulative_real = torch.cumprod(is_real.to(dtype=torch.long), dim=0).bool()
             is_real = cumulative_real

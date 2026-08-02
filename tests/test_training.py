@@ -32,7 +32,8 @@ def make_dataset() -> TransitionDataset:
 def test_two_horizon_training_smoke() -> None:
     torch.manual_seed(3)
     dataset = make_dataset()
-    token_dim = 1 + dataset.obs_dim + dataset.act_dim
+    # d_tok = reward + obs + act + injective-phi flag.
+    token_dim = 2 + dataset.obs_dim + dataset.act_dim
     schedule = DDPMSchedule.make_cosine(T=2)
     diffusion = BlockwiseDiffusion(schedule, token_dim)
     model = TrajectoryScoreNet(
@@ -78,9 +79,10 @@ def test_two_horizon_training_smoke() -> None:
 
 
 def test_adaln_zero_network_starts_at_zero() -> None:
-    model = TrajectoryScoreNet(2, 1, 4, model_dim=16, num_heads=2, num_layers=2)
+    # token_dim = 2 + obs(2) + act(1) = 5 (reward + obs + act + flag).
+    model = TrajectoryScoreNet(2, 1, 5, model_dim=16, num_heads=2, num_layers=2)
     output = model(
-        torch.randn(3, 2, 4),
+        torch.randn(3, 2, 5),
         torch.tensor([1, 2, 3]),
         torch.randn(3, 3),
         h=2,
@@ -119,9 +121,10 @@ def test_dataset_adds_absorbing_zero_reward_self_transition() -> None:
     assert raw_zero_reward == pytest.approx(0.0)
 
 
-def test_decoder_keeps_zero_reward_transition_and_stops_at_zero_padding() -> None:
+def test_decoder_keeps_zero_reward_transition_and_stops_at_flag_padding() -> None:
+    # token_dim = 2 + obs(2) + act(1) = 5; layout [r, s'(2), a'(1), flag].
     schedule = DDPMSchedule.make_cosine(2)
-    diffusion = BlockwiseDiffusion(schedule, token_dim=4)
+    diffusion = BlockwiseDiffusion(schedule, token_dim=5)
     evaluator = OPEEvaluator(
         diffusion,
         lambda z, x, t: torch.zeros_like(z),
@@ -132,9 +135,11 @@ def test_decoder_keeps_zero_reward_transition_and_stops_at_zero_padding() -> Non
     )
     tokens = torch.tensor(
         [
-            [0.0, 1.0, -1.0, 0.2],  # valid zero-reward transition
-            [0.0, 0.0, 0.0, 0.0],  # padding
-            [2.0, 1.0, 1.0, 1.0],  # must remain padding after first pad
+            # Zero-reward, near-zero transition: real thanks to REAL_FLAG (+1),
+            # which the old ‖token‖<threshold heuristic could have misread.
+            [0.0, 1.0, -1.0, 0.2, 1.0],
+            [0.0, 0.0, 0.0, 0.0, -1.0],  # padding (PAD_FLAG = -1)
+            [2.0, 1.0, 1.0, 1.0, 1.0],  # must remain padding after first pad
         ]
     )
     _, real = evaluator.decode_trajectory(tokens, h=3)

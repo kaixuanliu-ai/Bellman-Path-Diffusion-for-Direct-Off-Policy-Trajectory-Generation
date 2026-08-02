@@ -31,7 +31,7 @@ Schedule convention (variance-preserving, VP-SDE / DDPM):
 Shapes used throughout:
     B          – batch size
     h          – path horizon (number of tokens per path)
-    token_dim  – d_tok = 1 + obs_dim + act_dim
+    token_dim  – d_tok = 2 + obs_dim + act_dim (reward + obs + act + flag)
     T          – total diffusion timesteps (e.g. 1000)
 """
 
@@ -90,6 +90,7 @@ class DDPMSchedule:
         T: int = 1000,
         beta_start: float = 1e-4,
         beta_end: float = 0.02,
+        zero_terminal_snr: bool = True,
     ) -> "DDPMSchedule":
         """Linear schedule: β_t linearly interpolated from beta_start to beta_end.
 
@@ -97,18 +98,21 @@ class DDPMSchedule:
             T:          Number of diffusion steps.
             beta_start: β at t = 1.
             beta_end:   β at t = T.
+            zero_terminal_snr: If True, rescale so ᾱ_T = 0 exactly, giving the
+                        paper's source boundary α_T = 0, σ_T = 1 (Eq. 20).
 
         Returns:
             Fully initialised DDPMSchedule.
         """
         betas = torch.linspace(beta_start, beta_end, T, dtype=torch.float64)
-        return cls._from_betas(T, betas)
+        return cls._from_betas(T, betas, zero_terminal_snr=zero_terminal_snr)
 
     @classmethod
     def make_cosine(
         cls,
         T: int = 1000,
         s: float = 0.008,
+        zero_terminal_snr: bool = True,
     ) -> "DDPMSchedule":
         """Cosine schedule (Nichol & Dhariwal 2021).
 
@@ -117,6 +121,8 @@ class DDPMSchedule:
         Args:
             T: Number of diffusion steps.
             s: Offset hyperparameter (default 0.008).
+            zero_terminal_snr: If True, rescale so ᾱ_T = 0 exactly, giving the
+                        paper's source boundary α_T = 0, σ_T = 1 (Eq. 20).
 
         Returns:
             Fully initialised DDPMSchedule.
@@ -129,10 +135,41 @@ class DDPMSchedule:
         # β_t = 1 - ᾱ_t / ᾱ_{t-1}, clipped to [0, 0.999]
         betas = 1.0 - (alphas_bar_full[1:] / alphas_bar_full[:-1])
         betas = betas.clamp(0.0, 0.999)
-        return cls._from_betas(T, betas)
+        return cls._from_betas(T, betas, zero_terminal_snr=zero_terminal_snr)
+
+    @staticmethod
+    def _rescale_zero_terminal_snr(alphas_bar: Tensor) -> Tensor:
+        """Rescale ᾱ so that the terminal signal-to-noise ratio is exactly zero.
+
+        Enforces the paper's source boundary α_T = 0, σ_T = 1 (Eq. 20 /
+        paper.tex L409).  Standard cosine/linear schedules only approach
+        ᾱ_T ≈ 0 (cosine clips its final β to 0.999, leaving ᾱ_T ≈ 2.4e-9),
+        so the exact common-source theorem holds only numerically.  This linear
+        rescaling of sqrt(ᾱ_t) pins sqrt(ᾱ_0) = 1 and sqrt(ᾱ_T) = 0 while
+        preserving the schedule shape in between.
+
+        Reference: Lin et al. 2024, "Common Diffusion Noise Schedules and
+        Sample Steps are Flawed", Algorithm 1 (rescale_zero_terminal_snr).
+
+        Args:
+            alphas_bar: Cumulative products ᾱ_t, shape (T+1,), with ᾱ_0 = 1.
+
+        Returns:
+            Rescaled ᾱ_t, shape (T+1,), with ᾱ_0 = 1 and ᾱ_T = 0 exactly.
+        """
+        sqrt_ab = torch.sqrt(alphas_bar)
+        sqrt_ab_0 = sqrt_ab[0].clone()  # = 1
+        sqrt_ab_T = sqrt_ab[-1].clone()  # small positive residual to remove
+
+        # Shift the terminal to zero, then rescale so the origin stays at 1.
+        sqrt_ab = sqrt_ab - sqrt_ab_T
+        sqrt_ab = sqrt_ab * (sqrt_ab_0 / (sqrt_ab_0 - sqrt_ab_T))
+        return sqrt_ab ** 2
 
     @classmethod
-    def _from_betas(cls, T: int, betas: Tensor) -> "DDPMSchedule":
+    def _from_betas(
+        cls, T: int, betas: Tensor, zero_terminal_snr: bool = True
+    ) -> "DDPMSchedule":
         betas = betas.float()
         alphas = 1.0 - betas
 
@@ -141,6 +178,15 @@ class DDPMSchedule:
             [torch.ones(1, dtype=torch.float32), torch.cumprod(alphas, dim=0)],
             dim=0,
         )  # shape (T+1,)
+
+        if zero_terminal_snr:
+            # Pin ᾱ_T = 0 exactly (α_T = 0, σ_T = 1) and recover a consistent
+            # (betas, alphas) pair from the rescaled cumulative products so that
+            # the DDPM posterior coefficients below remain exact.
+            alphas_bar = cls._rescale_zero_terminal_snr(alphas_bar)
+            # α_t = ᾱ_t / ᾱ_{t-1}; denominators ᾱ_0..ᾱ_{T-1} are all > 0.
+            alphas = alphas_bar[1:] / alphas_bar[:-1]
+            betas = 1.0 - alphas
 
         sqrt_alphas_bar = torch.sqrt(alphas_bar)
         sqrt_one_minus_alphas_bar = torch.sqrt(1.0 - alphas_bar)

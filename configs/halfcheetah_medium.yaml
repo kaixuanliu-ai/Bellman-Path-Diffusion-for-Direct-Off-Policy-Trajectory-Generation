@@ -3,4 +3,4 @@ defaults:
 env: halfcheetah-medium-v2
 obs_dim: 17
 act_dim: 6
-token_dim: 24  # 1 reward + 17 obs + 6 act
+token_dim: 25  # 1 reward + 17 obs + 6 act + 1 injective-phi flag

@@ -139,8 +139,11 @@ class TrajectoryScoreNet(nn.Module):
         dropout: float = 0.0,
     ) -> None:
         super().__init__()
-        if token_dim != 1 + obs_dim + act_dim:
-            raise ValueError("token_dim must equal 1 + obs_dim + act_dim")
+        if token_dim != 2 + obs_dim + act_dim:
+            raise ValueError(
+                "token_dim must equal 2 + obs_dim + act_dim "
+                "(reward + obs + act + injective-phi flag)"
+            )
         if max_horizon < 1:
             raise ValueError("max_horizon must be positive")
         self.obs_dim = int(obs_dim)

@@ -18,8 +18,10 @@ dist/
 build/
 *.egg
 
-# Testing
+# Testing / linting caches
 .pytest_cache/
+.ruff_cache/
+.mypy_cache/
 .coverage
 htmlcov/
 

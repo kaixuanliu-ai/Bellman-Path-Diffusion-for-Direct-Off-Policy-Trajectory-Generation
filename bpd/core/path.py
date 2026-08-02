@@ -17,11 +17,19 @@ Key equations:
                                                               [Eq. 15]
 
 Token embedding layout (each row of the path tensor):
-  [r  |  s'_0 ... s'_{obs_dim-1}  |  a'_0 ... a'_{act_dim-1}]
-   ^1          ^obs_dim                       ^act_dim
+  [r  |  s'_0 ... s'_{obs_dim-1}  |  a'_0 ... a'_{act_dim-1}  |  flag]
+   ^1          ^obs_dim                       ^act_dim          ^1
+
+The trailing ``flag`` coordinate makes φ injective (paper.tex L384): every real
+token carries ``flag = +1`` and the padding token φ(⊥) carries ``flag = -1``
+with all other coordinates zero.  A real token can therefore never coincide
+with the padding token, and decoding is the exact inverse Φ_H^{-1}: a slot is
+padding iff its flag coordinate is negative.  This removes the earlier
+``‖token‖ < threshold`` heuristic, under which a near-zero real transition
+could be misread as padding.
 
 Shapes used throughout:
-  d_tok = 1 + obs_dim + act_dim
+  d_tok = 2 + obs_dim + act_dim   (reward + next_obs + next_action + flag)
   path tensor w  : (h, d_tok)   – float32
   pad mask       : (h,)         – bool, True where token is padding (⊥)
 """
@@ -33,6 +41,13 @@ from typing import Dict, Tuple
 import torch
 from torch import Tensor
 
+# Injective-φ flag convention: the last token coordinate is +1 for a real
+# transition token and -1 for the padding token φ(⊥) (paper.tex L384).
+REAL_FLAG: float = 1.0
+PAD_FLAG: float = -1.0
+# Decision boundary for the exact inverse Φ_H^{-1}: flag < PAD_THRESHOLD ⇒ pad.
+PAD_THRESHOLD: float = 0.0
+
 
 # ---------------------------------------------------------------------------
 # Token encoding / decoding
@@ -40,8 +55,8 @@ from torch import Tensor
 
 
 def token_dim(obs_dim: int, act_dim: int) -> int:
-    """Return d_tok = 1 + obs_dim + act_dim."""
-    return 1 + obs_dim + act_dim
+    """Return d_tok = 2 + obs_dim + act_dim (reward + obs + act + flag)."""
+    return 2 + obs_dim + act_dim
 
 
 def encode_token(
@@ -49,7 +64,10 @@ def encode_token(
     next_obs: Tensor,
     next_action: Tensor,
 ) -> Tensor:
-    """Encode a single transition into a token vector y ∈ R^{d_tok}.
+    """Encode a single transition into a real token vector y ∈ R^{d_tok}.
+
+    The returned token carries the real-token flag ``REAL_FLAG`` in its last
+    coordinate so that φ is injective with respect to the padding token.
 
     Args:
         reward:      Scalar reward r (Python float or 0-d / 1-d Tensor).
@@ -57,14 +75,46 @@ def encode_token(
         next_action: Next action a' of shape (act_dim,).
 
     Returns:
-        Token tensor of shape (d_tok,) = (1 + obs_dim + act_dim,).
+        Token tensor of shape (d_tok,) = (2 + obs_dim + act_dim,), with the
+        final coordinate set to ``REAL_FLAG``.
     """
     if not isinstance(reward, Tensor):
         reward = torch.tensor(reward, dtype=torch.float32)
     reward = reward.reshape(1).to(dtype=torch.float32)
     next_obs = next_obs.reshape(-1).to(dtype=torch.float32)
     next_action = next_action.reshape(-1).to(dtype=torch.float32)
-    return torch.cat([reward, next_obs, next_action], dim=0)
+    flag = torch.tensor([REAL_FLAG], dtype=torch.float32)
+    return torch.cat([reward, next_obs, next_action, flag], dim=0)
+
+
+def append_real_flag(y: Tensor) -> Tensor:
+    """Append the ``REAL_FLAG`` coordinate to a batch of (r, s', a') tokens.
+
+    Args:
+        y: Token tensor of shape (..., 1 + obs_dim + act_dim) holding the
+           reward/next-obs/next-action fields without the flag coordinate.
+
+    Returns:
+        Tensor of shape (..., 2 + obs_dim + act_dim) with ``REAL_FLAG`` in the
+        final coordinate.
+    """
+    flag = y.new_full((*y.shape[:-1], 1), REAL_FLAG)
+    return torch.cat([y, flag], dim=-1)
+
+
+def is_padding(token: Tensor) -> Tensor:
+    """Exact padding indicator: True where the flag coordinate is negative.
+
+    This is the exact inverse Φ_H^{-1} on clean tokens (paper.tex L384): a slot
+    is padding iff its final coordinate is below ``PAD_THRESHOLD``.
+
+    Args:
+        token: Tensor of shape (..., d_tok).
+
+    Returns:
+        Boolean tensor of shape (...,).
+    """
+    return token[..., -1] < PAD_THRESHOLD
 
 
 def encode_transition(
@@ -120,30 +170,36 @@ def decode_token(
 
     Returns:
         Tuple ``(reward, next_obs, next_action)`` with shapes
-        ``(1,)``, ``(obs_dim,)``, ``(act_dim,)``.
+        ``(1,)``, ``(obs_dim,)``, ``(act_dim,)``.  The trailing flag coordinate
+        is dropped.
     """
-    d_tok = 1 + obs_dim + act_dim
+    d_tok = 2 + obs_dim + act_dim
     if token.shape != (d_tok,):
         raise ValueError(
             f"token must have shape ({d_tok},); got {tuple(token.shape)}"
         )
     reward = token[0:1]
     next_obs = token[1 : 1 + obs_dim]
-    next_action = token[1 + obs_dim :]
+    next_action = token[1 + obs_dim : 1 + obs_dim + act_dim]
     return reward, next_obs, next_action
 
 
 def padding_token(d_tok: int, device: torch.device | None = None) -> Tensor:
-    """Return the padding token φ(⊥) = zeros(d_tok).
+    """Return the padding token φ(⊥) = (0, ..., 0, PAD_FLAG).
+
+    All coordinates are zero except the trailing flag, which is ``PAD_FLAG``.
+    This keeps φ injective with respect to every real token (paper.tex L384).
 
     Args:
         d_tok:  Token dimensionality.
         device: Target device.
 
     Returns:
-        Zero tensor of shape (d_tok,).
+        Tensor of shape (d_tok,) with the final coordinate set to ``PAD_FLAG``.
     """
-    return torch.zeros(d_tok, dtype=torch.float32, device=device)
+    tok = torch.zeros(d_tok, dtype=torch.float32, device=device)
+    tok[-1] = PAD_FLAG
+    return tok
 
 
 # ---------------------------------------------------------------------------
@@ -176,7 +232,10 @@ def stop_map(
     if h < 1:
         raise ValueError(f"h must be >= 1; got {h}")
 
+    # Fill every slot with the padding token φ(⊥) = (0,...,0,PAD_FLAG), then
+    # overwrite slot 0 with the real token y (which carries REAL_FLAG).
     w = torch.zeros(h, d_tok, dtype=torch.float32, device=y.device)
+    w[:, -1] = PAD_FLAG
     w[0] = y.to(dtype=torch.float32)
 
     pad_mask = torch.ones(h, dtype=torch.bool, device=y.device)
@@ -423,7 +482,9 @@ def build_path_from_rollout(
         * ``pad_mask`` has shape ``(h,)`` – ``True`` at padding positions.
     """
     d_tok = token_dim(obs_dim, act_dim)
+    # Initialise all slots to the padding token φ(⊥) = (0,...,0,PAD_FLAG).
     w = torch.zeros(h, d_tok, dtype=torch.float32)
+    w[:, -1] = PAD_FLAG
     pad_mask = torch.ones(h, dtype=torch.bool)
 
     for t, trans in enumerate(transitions[:h]):
