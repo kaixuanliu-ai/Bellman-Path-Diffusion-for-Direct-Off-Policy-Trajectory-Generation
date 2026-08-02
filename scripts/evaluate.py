@@ -52,6 +52,7 @@ from bpd.data.dataset import Normalizer, load_d4rl_dataset  # noqa: E402
 from bpd.evaluation.ope import OPEEvaluator  # noqa: E402
 from bpd.models.diffusion import BlockwiseDiffusion, DDPMSchedule  # noqa: E402
 from bpd.models.score_net import TrajectoryScoreNet  # noqa: E402
+from bpd.utils.perf import configure_performance  # noqa: E402
 from bpd.utils.serialization import load_checkpoint  # noqa: E402
 
 # ---------------------------------------------------------------------------
@@ -705,6 +706,7 @@ def main(argv: Optional[List[str]] = None) -> None:
     # ------------------------------------------------------------------
     _set_seed(args.seed)
     device = torch.device(args.device)
+    configure_performance(device)
     logger.info("Device: %s", device)
 
     t0 = time.perf_counter()

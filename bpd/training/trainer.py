@@ -29,6 +29,7 @@ from bpd.data.replay import SuffixReplayBuffer
 from bpd.models.diffusion import BlockwiseDiffusion
 from bpd.training.ema import EMA
 from bpd.utils.arrays import DataBatch
+from bpd.utils.perf import amp_enabled
 
 logger = logging.getLogger(__name__)
 
@@ -71,12 +72,16 @@ class BellmanPathDiffusionTrainer:
         self.replay_refresh_freq = int(self.config.get("replay_refresh_freq", 5_000))
         self.grad_clip_norm = float(self.config.get("grad_clip_norm", 1.0))
         self.checkpoint_dir = Path(self.config.get("checkpoint_dir", "checkpoints"))
+        # GPU throughput knobs (no-ops on CPU).
+        self.amp = bool(self.config.get("amp", True))
+        self.data_on_device = bool(self.config.get("data_on_device", True))
 
         if self.H < 1 or self.steps_per_horizon < 1 or self.batch_size < 1:
             raise ValueError("H, steps_per_horizon, and batch_size must be positive")
         self._teachers: Dict[int, nn.Module] = {}
         self._replay_buffers: Dict[int, SuffixReplayBuffer] = {}
         self._global_step = 0
+        self._scaler: Optional[torch.amp.GradScaler] = None
 
     def train_all_stages(
         self,
@@ -108,6 +113,16 @@ class BellmanPathDiffusionTrainer:
         device = torch.device(device)
         self.score_net.to(device).train()
         self.diffusion.to(device)
+        # Keep the transition dataset resident on the compute device so batch
+        # sampling is an on-device gather (no per-step host->device copies).
+        if self.data_on_device and dataset.states.device != device:
+            dataset.to(device)
+        # Mixed precision (CUDA only); GradScaler is created once and reused.
+        self._amp_on = amp_enabled(device, self.amp)
+        if self._scaler is None:
+            self._scaler = torch.amp.GradScaler(
+                device.type, enabled=self._amp_on
+            )
         teacher_fn = self._teacher_noise_fn(h)
 
         replay: Optional[SuffixReplayBuffer] = None
@@ -134,22 +149,25 @@ class BellmanPathDiffusionTrainer:
         for local_step in range(1, self.steps_per_horizon + 1):
             self._global_step += 1
             batch, next_action = self._sample_batch(dataset, eval_policy_fn, device)
-            loss = self.objective(
-                self.score_net,
-                teacher_fn,
-                batch,
-                h,
-                next_action=next_action,
-                replay_buffer=replay,
-            )
+            with torch.autocast(device_type=device.type, enabled=self._amp_on):
+                loss = self.objective(
+                    self.score_net,
+                    teacher_fn,
+                    batch,
+                    h,
+                    next_action=next_action,
+                    replay_buffer=replay,
+                )
 
             self.optimizer.zero_grad(set_to_none=True)
-            loss.backward()
+            self._scaler.scale(loss).backward()
             if self.grad_clip_norm > 0:
+                self._scaler.unscale_(self.optimizer)
                 nn.utils.clip_grad_norm_(
                     self.score_net.parameters(), self.grad_clip_norm
                 )
-            self.optimizer.step()
+            self._scaler.step(self.optimizer)
+            self._scaler.update()
             self.ema.update(self.score_net, step=self._global_step)
 
             final_loss = float(loss.detach().item())
@@ -197,11 +215,11 @@ class BellmanPathDiffusionTrainer:
             0, len(dataset), (self.batch_size,), device=dataset.states.device
         )
         batch = DataBatch(
-            state=dataset.states[index].to(device),
-            action=dataset.actions[index].to(device),
-            reward=dataset.rewards[index].to(device),
-            next_state=dataset.next_states[index].to(device),
-            done=dataset.dones[index].to(device),
+            state=dataset.states[index].to(device, non_blocking=True),
+            action=dataset.actions[index].to(device, non_blocking=True),
+            reward=dataset.rewards[index].to(device, non_blocking=True),
+            next_state=dataset.next_states[index].to(device, non_blocking=True),
+            done=dataset.dones[index].to(device, non_blocking=True),
         )
         with torch.no_grad():
             next_action = eval_policy_fn(batch.next_state)

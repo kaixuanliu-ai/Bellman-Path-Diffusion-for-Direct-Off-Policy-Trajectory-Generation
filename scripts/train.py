@@ -94,6 +94,7 @@ from bpd.models.diffusion import BlockwiseDiffusion, DDPMSchedule  # noqa: E402
 from bpd.models.score_net import TrajectoryScoreNet  # noqa: E402
 from bpd.training.ema import EMA  # noqa: E402
 from bpd.training.trainer import BellmanPathDiffusionTrainer  # noqa: E402
+from bpd.utils.perf import configure_performance, resolve_device  # noqa: E402
 from bpd.utils.serialization import save_checkpoint, save_config  # noqa: E402
 
 logger = logging.getLogger(__name__)
@@ -366,6 +367,36 @@ def _build_parser() -> argparse.ArgumentParser:
             "Auto-selects CUDA if available when not specified."
         ),
     )
+    p.add_argument(
+        "--amp",
+        action="store_true",
+        default=True,
+        help="Enable CUDA mixed-precision autocast (default on; CPU ignores).",
+    )
+    p.add_argument(
+        "--no_amp",
+        dest="amp",
+        action="store_false",
+        help="Disable mixed precision (force float32).",
+    )
+    p.add_argument(
+        "--num_threads",
+        type=int,
+        default=None,
+        help="CPU intra-op threads (default: all cores).",
+    )
+    p.add_argument(
+        "--data_on_device",
+        action="store_true",
+        default=True,
+        help="Keep the transition dataset resident on the GPU (default on).",
+    )
+    p.add_argument(
+        "--no_data_on_device",
+        dest="data_on_device",
+        action="store_false",
+        help="Stream minibatches from host memory instead.",
+    )
 
     return p
 
@@ -569,11 +600,8 @@ def train(args: argparse.Namespace) -> None:
     # ------------------------------------------------------------------
     set_random_seed(args.seed)
 
-    if args.device is not None:
-        device = torch.device(args.device)
-    else:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
+    device = resolve_device(args.device)
+    configure_performance(device, num_threads=args.num_threads)
     logger.info("Using device: %s", device)
 
     # ------------------------------------------------------------------
@@ -667,6 +695,7 @@ def train(args: argparse.Namespace) -> None:
         token_dim=d_tok,
         loss_weight_fn=None,  # uniform lambda(t) = 1 (Ho et al. 2020 Eq. 14)
         diffusion=diffusion,
+        prediction_type=args.prediction_type,
     )
 
     # ------------------------------------------------------------------
@@ -701,6 +730,8 @@ def train(args: argparse.Namespace) -> None:
         "replay_refresh_freq": args.replay_refresh_freq,
         "diffusion_steps": args.diffusion_steps,
         "checkpoint_dir": str(ckpt_dir),
+        "amp": args.amp,
+        "data_on_device": args.data_on_device,
     }
 
     # ------------------------------------------------------------------

@@ -427,6 +427,32 @@ class TransitionDataset(torch.utils.data.Dataset):
         return encode_token(reward, next_state, next_action)
 
     # ------------------------------------------------------------------
+    # Device management
+    # ------------------------------------------------------------------
+
+    def to(self, device: Union[str, torch.device]) -> "TransitionDataset":
+        """Move all cached transition tensors onto ``device`` in place.
+
+        Keeping the whole (small) transition dataset resident on the GPU turns
+        per-step minibatch sampling into an on-device gather, so the training
+        loop never blocks on host->device copies.  Returns ``self`` for
+        chaining.
+
+        Args:
+            device: Target device.
+
+        Returns:
+            This dataset (moved in place).
+        """
+        self.device = torch.device(device)
+        self._states = self._states.to(self.device)
+        self._actions = self._actions.to(self.device)
+        self._rewards = self._rewards.to(self.device)
+        self._next_states = self._next_states.to(self.device)
+        self._dones = self._dones.to(self.device)
+        return self
+
+    # ------------------------------------------------------------------
     # Convenience properties
     # ------------------------------------------------------------------
 
