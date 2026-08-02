@@ -125,8 +125,17 @@ def load_checkpoint(
 
     map_location: Union[str, torch.device] = device if device is not None else "cpu"
 
+    # BPD checkpoints bundle NumPy normalizer statistics alongside tensors.
+    # PyTorch >= 2.6 defaults torch.load to weights_only=True, which rejects
+    # those objects, so we deserialize with weights_only=False (trusted local
+    # checkpoints).  Older PyTorch versions do not accept the kwarg.
     try:
-        state_dict = torch.load(ckpt_path, map_location=map_location)
+        try:
+            state_dict = torch.load(
+                ckpt_path, map_location=map_location, weights_only=False
+            )
+        except TypeError:
+            state_dict = torch.load(ckpt_path, map_location=map_location)
     except Exception as exc:
         raise RuntimeError(
             f"Failed to load checkpoint from '{ckpt_path}': {exc}"
@@ -254,9 +263,11 @@ def _checkpoint_sort_key(p: Path) -> int:
 def get_latest_checkpoint(checkpoint_dir: PathLike) -> Path:
     """Return the path of the most recent ``.pt`` file in *checkpoint_dir*.
 
-    "Most recent" is determined first by the largest integer embedded in the
-    filename (e.g. ``checkpoint_step_5000.pt`` > ``checkpoint_step_1000.pt``),
-    and then by modification time as a tiebreaker.
+    A ``final.pt`` (or ``final.pth``) checkpoint is preferred when present,
+    since only the final checkpoint bundles the full model config and
+    normalizer needed for evaluation.  Otherwise the checkpoint with the
+    largest integer embedded in its filename is returned (ties broken by
+    modification time).
 
     Parameters
     ----------
@@ -266,7 +277,7 @@ def get_latest_checkpoint(checkpoint_dir: PathLike) -> Path:
     Returns
     -------
     Path
-        Absolute path of the latest checkpoint.
+        Absolute path of the selected checkpoint.
 
     Raises
     ------
@@ -279,21 +290,20 @@ def get_latest_checkpoint(checkpoint_dir: PathLike) -> Path:
             f"Checkpoint directory not found: '{ckpt_dir}'"
         )
 
-    candidates = sorted(
-        ckpt_dir.glob("*.pt"),
-        key=lambda p: (_checkpoint_sort_key(p), p.stat().st_mtime),
-    )
-
-    # Also pick up .pth files used by some frameworks.
-    candidates += sorted(
-        ckpt_dir.glob("*.pth"),
-        key=lambda p: (_checkpoint_sort_key(p), p.stat().st_mtime),
-    )
+    candidates = list(ckpt_dir.glob("*.pt")) + list(ckpt_dir.glob("*.pth"))
 
     if not candidates:
         raise FileNotFoundError(
             f"No .pt/.pth checkpoints found in '{ckpt_dir}'"
         )
+
+    # Prefer an explicit final checkpoint: it carries the complete config and
+    # normalizer required by the evaluator (periodic checkpoints do not).
+    final_candidates = [p for p in candidates if p.stem.lower() == "final"]
+    if final_candidates:
+        latest = max(final_candidates, key=lambda p: p.stat().st_mtime)
+        logger.debug("Selected final checkpoint in '%s': %s", ckpt_dir, latest.name)
+        return latest.resolve()
 
     latest = max(
         candidates,

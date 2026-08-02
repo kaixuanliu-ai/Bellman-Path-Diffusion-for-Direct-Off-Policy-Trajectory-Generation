@@ -1,11 +1,18 @@
 """Bellman stop/continuation targets for the discrete DDPM parameterization.
 
 The paper defines score targets in Equations (41)--(47).  Appendix C gives the
-equivalent epsilon-prediction form used here:
+equivalent regression form used here.  Both the v- and epsilon-parameterisations
+express the same score field:
 
-* stop: predict the sampled Gaussian noise for every block;
-* continue: predict the sampled head noise followed by the frozen teacher's
-  suffix noise prediction at the same diffusion index.
+* stop: regress the network onto the sampled noise (epsilon) or the velocity
+  v = α_t·ε − σ_t·x₀ (v-prediction) for every block;
+* continue: regress the head block onto its own sampled-noise/velocity target,
+  then concatenate the frozen teacher's prediction on the noisy suffix at the
+  same diffusion index.
+
+The prediction basis (v vs epsilon) is taken from ``diffusion.prediction_type``.
+v-prediction is the default because it keeps x₀ recovery finite at the exact
+source α_T = 0 (paper.tex L409).
 
 The continuation probability ``gamma`` is deliberately absent from these
 component targets.  It enters once, through sampling the Bellman branch.
@@ -27,7 +34,12 @@ TeacherNoiseFn = Callable[[Tensor, Tensor, Tensor, int], Tensor]
 
 @dataclass(frozen=True)
 class BranchTarget:
-    """A noisy path and its epsilon-prediction regression target."""
+    """A noisy path and its regression target.
+
+    ``target_noise`` is the network's regression target in the active
+    parameterisation: the sampled noise ε for ``prediction_type == "epsilon"``,
+    or the velocity v = α_t·ε − σ_t·x₀ for ``prediction_type == "v"``.
+    """
 
     z_t: Tensor
     target_noise: Tensor
@@ -73,7 +85,12 @@ class StopBranch:
                 f"{tuple(clean_path.shape)}, got {tuple(noise.shape)}"
             )
         z_t = self.diffusion.q_sample_blockwise(clean_path, t, noise=noise)
-        return BranchTarget(z_t=z_t, target_noise=noise, clean_path=clean_path)
+        # Regression target in the active parameterisation.
+        if self.diffusion.prediction_type == "v":
+            target = self.diffusion.v_target(clean_path, noise, t)
+        else:
+            target = noise
+        return BranchTarget(z_t=z_t, target_noise=target, clean_path=clean_path)
 
 
 class ContinueBranch:
@@ -128,6 +145,8 @@ class ContinueBranch:
         z_t = self.diffusion.q_sample_blockwise(clean_path, t, noise=noise)
 
         with torch.no_grad():
+            # The frozen teacher predicts in the same parameterisation (v or
+            # epsilon), so its output is used directly as the suffix target.
             suffix_target = teacher_noise_fn(z_t[:, 1:], t, x_prime, h - 1)
         if suffix_target.shape != expected_suffix:
             raise ValueError(
@@ -135,8 +154,17 @@ class ContinueBranch:
                 f"expected {expected_suffix}"
             )
 
+        # Head-block target in the active parameterisation (analytic: the head
+        # transition y is known exactly).
+        if self.diffusion.prediction_type == "v":
+            head_target = self.diffusion.v_target(
+                clean_path[:, :1], noise[:, :1], t
+            )
+        else:
+            head_target = noise[:, :1]
+
         # Appendix C: no gamma multiplier inside the component target.
-        target_noise = torch.cat((noise[:, :1], suffix_target.detach()), dim=1)
+        target_noise = torch.cat((head_target, suffix_target.detach()), dim=1)
         return BranchTarget(
             z_t=z_t,
             target_noise=target_noise,

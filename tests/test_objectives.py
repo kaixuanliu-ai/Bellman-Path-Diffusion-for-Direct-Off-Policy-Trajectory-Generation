@@ -27,11 +27,14 @@ def make_batch(batch_size: int = 8) -> DataBatch:
     )
 
 
-def make_objective(gamma: float = 0.8, steps: int = 4) -> BellmanDiffusionLoss:
+def make_objective(
+    gamma: float = 0.8, steps: int = 4, prediction_type: str = "v"
+) -> BellmanDiffusionLoss:
     return BellmanDiffusionLoss(
         gamma=gamma,
         schedule=DDPMSchedule.make_cosine(steps),
         token_dim=TOKEN_DIM,
+        prediction_type=prediction_type,
     )
 
 
@@ -40,7 +43,8 @@ def zero_teacher(z_t, t, x, h):
 
 
 def test_stop_target_is_sampled_noise() -> None:
-    objective = make_objective()
+    # Under epsilon-prediction the stop target is exactly the sampled noise.
+    objective = make_objective(prediction_type="epsilon")
     batch = make_batch(3)
     next_action = torch.randn(3, ACT_DIM)
     noise = torch.randn(3, 4, TOKEN_DIM)
@@ -56,9 +60,36 @@ def test_stop_target_is_sampled_noise() -> None:
     torch.testing.assert_close(target.target_noise, noise)
 
 
+def test_stop_target_is_v_under_v_prediction() -> None:
+    # Under v-prediction (default) the stop target is v = alpha_t*eps - sigma_t*x0.
+    objective = make_objective(prediction_type="v")
+    batch = make_batch(3)
+    next_action = torch.randn(3, ACT_DIM)
+    noise = torch.randn(3, 4, TOKEN_DIM)
+    target = objective.build_targets(
+        None,
+        batch,
+        4,
+        next_action=next_action,
+        timesteps=torch.tensor([1, 2, 3]),
+        continuation=torch.zeros(3, dtype=torch.bool),
+        noise=noise,
+    )
+    # Reconstruct the clean path by inverting q_sample: x0 = (z_t - sigma*eps)/alpha.
+    t = torch.tensor([1, 2, 3])
+    diff = objective.diffusion
+    alpha = diff.sqrt_alphas_bar[t].view(-1, 1, 1)
+    sigma = diff.sqrt_one_minus_alphas_bar[t].view(-1, 1, 1)
+    clean = (target.z_t - sigma * noise) / alpha
+    expected = diff.v_target(clean, noise, t)
+    torch.testing.assert_close(target.target_noise, expected)
+
+
 def test_continuation_is_head_noise_plus_unscaled_teacher_noise() -> None:
+    # Epsilon-prediction: head target is the sampled noise; suffix target is the
+    # frozen teacher output with NO gamma multiplier.
     gamma = 0.25
-    objective = make_objective(gamma=gamma, steps=2)
+    objective = make_objective(gamma=gamma, steps=2, prediction_type="epsilon")
     batch = make_batch(2)
     next_action = torch.randn(2, ACT_DIM)
     noise = torch.randn(2, 3, TOKEN_DIM)
@@ -83,6 +114,44 @@ def test_continuation_is_head_noise_plus_unscaled_teacher_noise() -> None:
         target.target_noise[:, 1:],
         torch.full_like(target.target_noise[:, 1:], gamma * 3.0),
     )
+
+
+def test_continuation_suffix_is_unscaled_teacher_under_v_prediction() -> None:
+    # v-prediction: suffix target is still the frozen teacher output with NO
+    # gamma multiplier; the head target is the v of the known head transition.
+    gamma = 0.25
+    # steps=4 keeps timesteps away from the terminal (alpha_T=0), where the
+    # clean-path reconstruction by division would be singular.
+    objective = make_objective(gamma=gamma, steps=4, prediction_type="v")
+    batch = make_batch(2)
+    next_action = torch.randn(2, ACT_DIM)
+    noise = torch.randn(2, 3, TOKEN_DIM)
+    timesteps = torch.tensor([1, 2])
+
+    def constant_teacher(z_t, t, x, h):
+        return torch.full_like(z_t, 3.0)
+
+    target = objective.build_targets(
+        constant_teacher,
+        batch,
+        3,
+        next_action=next_action,
+        timesteps=timesteps,
+        continuation=torch.ones(2, dtype=torch.bool),
+        noise=noise,
+    )
+    # Suffix target == teacher output, unscaled by gamma.
+    torch.testing.assert_close(
+        target.target_noise[:, 1:], torch.full_like(target.target_noise[:, 1:], 3.0)
+    )
+    # Head target == v of the (known) head transition; reconstruct its clean
+    # value by inverting q_sample on the head block.
+    diff = objective.diffusion
+    alpha = diff.sqrt_alphas_bar[timesteps].view(-1, 1, 1)
+    sigma = diff.sqrt_one_minus_alphas_bar[timesteps].view(-1, 1, 1)
+    clean_head = (target.z_t[:, :1] - sigma * noise[:, :1]) / alpha
+    expected_head = diff.v_target(clean_head, noise[:, :1], timesteps)
+    torch.testing.assert_close(target.target_noise[:, :1], expected_head)
 
 
 def test_evaluation_policy_action_defines_token_and_successor_condition() -> None:

@@ -295,9 +295,16 @@ class BlockwiseDiffusion(nn.Module):
         schedule:   Pre-built DDPMSchedule (linear or cosine).
         token_dim:  Dimensionality of each token d_tok.
 
-    Note on score-network convention:
-        ``score_net`` is expected to predict *noise* ε_θ (epsilon-prediction).
-        Internally we convert ε → score via ``score = -ε / σ_t``.
+    Prediction parameterisation:
+        ``prediction_type="v"`` (default): the network predicts the velocity
+        v = α_t·ε − σ_t·x₀ (Salimans & Ho 2022).  This is required for the
+        exact source boundary α_T = 0 (paper.tex L409): recovering x₀ then uses
+        x̂₀ = α_t·z_t − σ_t·v, which stays finite at α_T = 0 (x̂₀ = −v), unlike
+        the epsilon recovery x̂₀ = (z_t − σ_t·ε)/α_t whose 1/α_T factor is
+        singular at the source (Lin et al. 2024, "Common Diffusion Noise
+        Schedules and Sample Steps are Flawed").
+        ``prediction_type="epsilon"``: the network predicts the noise ε_θ.
+        Both are the same score field up to an affine reparameterisation.
     """
 
     def __init__(
@@ -305,12 +312,18 @@ class BlockwiseDiffusion(nn.Module):
         schedule: DDPMSchedule,
         token_dim: int,
         clip_denoised: bool = False,
+        prediction_type: str = "v",
     ) -> None:
         super().__init__()
+        if prediction_type not in ("v", "epsilon"):
+            raise ValueError(
+                f"prediction_type must be 'v' or 'epsilon'; got {prediction_type!r}"
+            )
         self.schedule = schedule
         self.token_dim = token_dim
         self.T = schedule.T
         self.clip_denoised = bool(clip_denoised)
+        self.prediction_type = prediction_type
 
         # Register all schedule tensors as buffers so they move with .to(device)
         self.register_buffer("alphas_bar", schedule.alphas_bar)
@@ -455,31 +468,60 @@ class BlockwiseDiffusion(nn.Module):
     # DDPM posterior (used in reverse step)
     # ------------------------------------------------------------------
 
+    def v_target(self, x0: Tensor, noise: Tensor, t: Tensor) -> Tensor:
+        """Velocity target v = α_t·ε − σ_t·x₀ (Salimans & Ho 2022).
+
+        This is the regression target when ``prediction_type == "v"``.
+
+        Args:
+            x0:    Clean tokens x₀ (= clean path), shape (B, h, d).
+            noise: Sampled Gaussian noise ε, shape (B, h, d).
+            t:     Timesteps, shape (B,).
+
+        Returns:
+            Velocity v, shape (B, h, d).
+        """
+        shape = x0.shape
+        alpha_t = self._extract(self.sqrt_alphas_bar, t, shape)
+        sigma_t = self._extract(self.sqrt_one_minus_alphas_bar, t, shape)
+        return alpha_t * noise - sigma_t * x0
+
+    def predict_x0(self, z_t: Tensor, t: Tensor, model_output: Tensor) -> Tensor:
+        """Recover the x₀ estimate from the network output.
+
+        For ``prediction_type == "v"``:
+            x̂₀ = α_t·z_t − σ_t·v        (finite at α_T = 0, where x̂₀ = −v)
+        For ``prediction_type == "epsilon"``:
+            x̂₀ = (z_t − σ_t·ε) / α_t    (Tweedie; singular at α_T = 0)
+
+        Args:
+            z_t:          Noisy samples, shape (B, h, d).
+            t:            Timesteps, shape (B,).
+            model_output: Network output (v or ε), shape (B, h, d).
+
+        Returns:
+            Estimated x₀, shape (B, h, d).
+        """
+        shape = z_t.shape
+        sqrt_ab = self._extract(self.sqrt_alphas_bar, t, shape)
+        sqrt_one_minus_ab = self._extract(self.sqrt_one_minus_alphas_bar, t, shape)
+
+        if self.prediction_type == "v":
+            return sqrt_ab * z_t - sqrt_one_minus_ab * model_output
+        # epsilon-prediction
+        return (z_t - sqrt_one_minus_ab * model_output) / sqrt_ab.clamp(min=1e-8)
+
     def _predict_z0_from_noise(
         self,
         z_t: Tensor,
         t: Tensor,
         noise_pred: Tensor,
     ) -> Tensor:
-        """Recover z_0 estimate from predicted noise via Tweedie formula.
-
-        z_0 = (z_t - σ_t * ε_θ) / α_t
-
-        Args:
-            z_t:        Noisy samples, shape (B, h, d).
-            t:          Timesteps, shape (B,).
-            noise_pred: Predicted noise from score_net, shape (B, h, d).
-
-        Returns:
-            Estimated z_0, shape (B, h, d).
-        """
+        """Backward-compatible epsilon-only x₀ recovery (z_0 = (z_t-σ_tε)/α_t)."""
         shape = z_t.shape
         sqrt_ab = self._extract(self.sqrt_alphas_bar, t, shape)
         sqrt_one_minus_ab = self._extract(self.sqrt_one_minus_alphas_bar, t, shape)
-
-        # z_0 = (z_t - σ_t * ε) / α_t
-        z0_hat = (z_t - sqrt_one_minus_ab * noise_pred) / sqrt_ab.clamp(min=1e-8)
-        return z0_hat
+        return (z_t - sqrt_one_minus_ab * noise_pred) / sqrt_ab.clamp(min=1e-8)
 
     def _q_posterior_mean(
         self,
@@ -527,13 +569,16 @@ class BlockwiseDiffusion(nn.Module):
 
         where:
             μ̃_θ(z_t, x, t) = coef1 * ẑ_0 + coef2 * z_t
-            ẑ_0 = (z_t - σ_t * ε_θ) / α_t   (Tweedie / epsilon-prediction)
+            ẑ_0 is recovered from the network output according to
+            ``self.prediction_type`` ("v" or "epsilon"); the "v" recovery is
+            finite at the exact source α_T = 0.
 
         At t = 1, no noise is added (deterministic final step).
 
         Args:
-            score_net_output: Predicted noise ε_θ from the score/noise network,
-                              shape (B, h, token_dim).
+            score_net_output: Network output — velocity v_θ when
+                              ``prediction_type == "v"`` (default) or noise ε_θ
+                              when ``"epsilon"``, shape (B, h, token_dim).
             z_t:              Current noisy trajectory, shape (B, h, token_dim).
             t:                Current discrete timestep (Python int, 1 ≤ t ≤ T).
             x:                Conditioning context, shape (B, obs_dim).
@@ -547,8 +592,8 @@ class BlockwiseDiffusion(nn.Module):
         device = z_t.device
         t_tensor = torch.full((B,), t, dtype=torch.long, device=device)
 
-        # Estimate z_0 from predicted noise
-        z0_hat = self._predict_z0_from_noise(z_t, t_tensor, score_net_output)
+        # Estimate x_0 from the network output (v- or epsilon-parameterised).
+        z0_hat = self.predict_x0(z_t, t_tensor, score_net_output)
         # Clipping is valid only when every token field is normalized to
         # [-1, 1].  BPD also supports Gaussian-normalized continuous tokens,
         # so the paper-faithful default leaves z0_hat unconstrained.
@@ -677,28 +722,27 @@ class BlockwiseDiffusion(nn.Module):
         t: Optional[Tensor] = None,
         noise: Optional[Tensor] = None,
     ) -> dict[str, Tensor]:
-        """Compute the DDPM training loss (simple ε-prediction objective).
+        """Compute the simple single-horizon DDPM regression loss.
 
-        L_simple = E_{t,ε}[ || ε - ε_θ(z_t, x, t) ||² ]
+        L_simple = E_{t,ε}[ || target − f_θ(z_t, t, x, h) ||² ]
 
-        This is the objective used in Ho et al. 2020 (Eq. 14).  For BPD it
-        serves as the denoising score-matching loss for the blockwise kernel.
+        where the target and network output are velocities (v-prediction) or
+        noises (epsilon-prediction) per ``self.prediction_type``.  This is a
+        non-Bellman utility (Ho et al. 2020 style); the BPD training objective
+        is :class:`~bpd.core.objectives.BellmanDiffusionLoss`.
 
         Args:
-            score_net: Noise-prediction network ε_θ.
+            score_net: The trajectory network f_θ with signature
+                       ``score_net(z_t, t, x, h)``.
             w:         Clean trajectory tokens, shape (B, h, token_dim).
-            x:         Conditioning context, shape (B, obs_dim).
+            x:         Conditioning context, shape (B, obs_dim + act_dim).
             t:         Optional pre-sampled timesteps, shape (B,).
                        If None, uniformly sampled from {1, ..., T}.
             noise:     Optional pre-sampled Gaussian noise, shape (B, h, d).
                        If None, freshly sampled.
 
         Returns:
-            Dictionary with keys:
-                ``"loss"``    – scalar mean squared error.
-                ``"noise"``   – the target noise ε used (for logging).
-                ``"z_t"``     – the noisy sample used as input to score_net.
-                ``"t"``       – the timestep indices used.
+            Dictionary with keys ``"loss"``, ``"target"``, ``"z_t"``, ``"t"``.
         """
         B, h, d = w.shape
         device = w.device
@@ -710,13 +754,19 @@ class BlockwiseDiffusion(nn.Module):
             noise = torch.randn_like(w)
 
         z_t = self.q_sample_blockwise(w, t, noise=noise)
-        noise_pred = score_net(z_t, x, t)
+        # Match TrajectoryScoreNet's (z, t, x, h) call signature.
+        prediction = score_net(z_t, t, x, h)
 
-        loss = ((noise_pred - noise) ** 2).mean()
+        if self.prediction_type == "v":
+            target = self.v_target(w, noise, t)
+        else:
+            target = noise
+
+        loss = ((prediction - target) ** 2).mean()
 
         return {
             "loss": loss,
-            "noise": noise,
+            "target": target,
             "z_t": z_t,
             "t": t,
         }

@@ -502,3 +502,47 @@ class TestSourceEndpoint:
             f"At t=1 with large positive clean signal, mean should be >>0; "
             f"got {mean_abs:.4f}"
         )
+
+
+class TestVPredictionSourceStability:
+    """v-prediction keeps x0 recovery finite at the exact source alpha_T=0."""
+
+    def test_v_x0_recovery_finite_at_source(self):
+        # With zero-terminal-SNR the terminal alpha_T is exactly 0.
+        diff = BlockwiseDiffusion(
+            DDPMSchedule.make_cosine(T=T_STEPS), token_dim=TOKEN_DIM,
+            prediction_type="v",
+        )
+        assert float(diff.sqrt_alphas_bar[-1]) == 0.0
+        z_T = torch.randn(BATCH, H, TOKEN_DIM)
+        v_pred = torch.randn(BATCH, H, TOKEN_DIM)
+        t = torch.full((BATCH,), T_STEPS, dtype=torch.long)  # terminal index
+        x0 = diff.predict_x0(z_T, t, v_pred)
+        # v-recovery x0 = alpha_T*z_T - sigma_T*v = -v at the source: finite.
+        assert torch.isfinite(x0).all()
+        torch.testing.assert_close(x0, -v_pred)
+
+    def test_epsilon_x0_recovery_is_singular_at_source(self):
+        # The epsilon recovery divides by alpha_T (clamped) -> huge amplification,
+        # which is exactly why v-prediction is used for the exact source.
+        diff = BlockwiseDiffusion(
+            DDPMSchedule.make_cosine(T=T_STEPS), token_dim=TOKEN_DIM,
+            prediction_type="epsilon",
+        )
+        z_T = torch.randn(BATCH, H, TOKEN_DIM)
+        eps_pred = torch.zeros(BATCH, H, TOKEN_DIM)  # eps != z_T -> no cancellation
+        t = torch.full((BATCH,), T_STEPS, dtype=torch.long)
+        x0 = diff.predict_x0(z_T, t, eps_pred)
+        # (z_T - 0)/clamp(0,1e-8) = 1e8 * z_T -> enormous magnitude.
+        assert x0.abs().max().item() > 1e6
+
+    def test_v_reverse_chain_is_finite(self):
+        diff = BlockwiseDiffusion(
+            DDPMSchedule.make_cosine(T=50), token_dim=6, prediction_type="v",
+        )
+
+        def net(z, x, t):
+            return torch.zeros_like(z)
+
+        out = diff.p_sample_loop(net, x=torch.zeros(4, 3), h=3, batch_size=4, device="cpu")
+        assert torch.isfinite(out).all()

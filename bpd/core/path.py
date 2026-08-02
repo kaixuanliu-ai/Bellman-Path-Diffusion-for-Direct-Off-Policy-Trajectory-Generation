@@ -78,12 +78,15 @@ def encode_token(
         Token tensor of shape (d_tok,) = (2 + obs_dim + act_dim,), with the
         final coordinate set to ``REAL_FLAG``.
     """
-    if not isinstance(reward, Tensor):
-        reward = torch.tensor(reward, dtype=torch.float32)
-    reward = reward.reshape(1).to(dtype=torch.float32)
+    # Anchor the device on next_obs so reward/flag are created on the same
+    # device (CPU or CUDA); torch.cat requires all inputs to share a device.
+    device = next_obs.device
     next_obs = next_obs.reshape(-1).to(dtype=torch.float32)
-    next_action = next_action.reshape(-1).to(dtype=torch.float32)
-    flag = torch.tensor([REAL_FLAG], dtype=torch.float32)
+    next_action = next_action.reshape(-1).to(dtype=torch.float32, device=device)
+    if not isinstance(reward, Tensor):
+        reward = torch.tensor(reward, dtype=torch.float32, device=device)
+    reward = reward.reshape(1).to(dtype=torch.float32, device=device)
+    flag = torch.full((1,), REAL_FLAG, dtype=torch.float32, device=device)
     return torch.cat([reward, next_obs, next_action, flag], dim=0)
 
 

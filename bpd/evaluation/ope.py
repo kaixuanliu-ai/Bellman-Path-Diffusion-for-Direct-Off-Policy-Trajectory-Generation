@@ -504,39 +504,47 @@ class OPEEvaluator:
 
     def corollary1_error_bound(
         self,
-        score_matching_residuals: List[float],
+        return_stage_errors: List[float],
     ) -> float:
         """Compute the Corollary 1 upper bound on the OPE approximation error.
 
-        Eq. 61:
+        Eq. 61 / Eq. 68:
             |J̄_H(π) - J_H(π)| ≤ δ_H^G ≤ Σ_{h=1}^H γ^{H-h} ε_h^G
 
-        where ε_h^G is the per-horizon score-matching residual (i.e. the
-        denoising error at horizon h) and γ is the discount factor.
+        Here ε_h^G is the **return-seminorm (G-seminorm) Bellman stage error**
+        of Eq. 66 — NOT a score-matching / denoising residual:
+
+            ε_h^G = sup_x | V̂_h(x)
+                            - ∫ κ_π(dy|x) [ r(y) + γ V̂_{h-1}(next_x(y)) ] |,
+
+        i.e. the one-step Bellman residual of the *learned* path law's expected
+        undiscounted return V̂_h(x) = E_{W_h ~ M̂_h(·|x)}[G_h(W_h)].  It measures
+        how far the generated horizon-h return is from applying one exact
+        evaluation-policy Bellman backup to the horizon-(h-1) return, and must
+        be estimated empirically from generated trajectories, not read off the
+        training loss.
 
         Args:
-            score_matching_residuals: List of H floats [ε_1^G, ..., ε_H^G],
-                                      one per horizon level.  ε_h^G is the
-                                      score-matching residual when training the
-                                      model to denoise H-horizon path
-                                      distributions.
+            return_stage_errors: List of H floats [ε_1^G, ..., ε_H^G], one per
+                                 horizon level, each the G-seminorm stage error
+                                 defined above.
 
         Returns:
             Upper bound δ_H^G as a Python float.
 
         Raises:
-            ValueError: If the length of ``score_matching_residuals`` does not
-                        equal the configured horizon H.
+            ValueError: If the length of ``return_stage_errors`` does not equal
+                        the configured horizon H.
         """
-        if len(score_matching_residuals) != self.H:
+        if len(return_stage_errors) != self.H:
             raise ValueError(
-                f"score_matching_residuals must have length H={self.H}; "
-                f"got {len(score_matching_residuals)}."
+                f"return_stage_errors must have length H={self.H}; "
+                f"got {len(return_stage_errors)}."
             )
 
         # δ_H^G = Σ_{h=1}^H γ^{H-h} ε_h^G
         bound = 0.0
-        for h_idx, eps_h in enumerate(score_matching_residuals):
+        for h_idx, eps_h in enumerate(return_stage_errors):
             # h_idx = h - 1 (0-based), so h = h_idx + 1
             h = h_idx + 1
             weight = self.gamma ** (self.H - h)  # γ^{H-h}
@@ -553,7 +561,7 @@ class OPEEvaluator:
         initial_states: Tensor,
         n_trajectories: int,
         device: Union[torch.device, str],
-        score_matching_residuals: Optional[List[float]] = None,
+        return_stage_errors: Optional[List[float]] = None,
         verbose: bool = False,
     ) -> Dict[str, object]:
         """Run the complete OPE pipeline and return a diagnostics dictionary.
@@ -565,7 +573,8 @@ class OPEEvaluator:
             initial_states:            Initial state tensor (N_init, obs_dim).
             n_trajectories:            Number M of Monte-Carlo samples.
             device:                    Compute device.
-            score_matching_residuals:  Optional list of H score residuals for
+            return_stage_errors:       Optional list of H G-seminorm return
+                                       stage errors ε_h^G (Eq. 66) for the
                                        Corollary 1 bound.  If None the bound
                                        is not computed.
             verbose:                   If True, log summary statistics via the
@@ -578,7 +587,7 @@ class OPEEvaluator:
             * ``"length_dist"``      – dict returned by
                                        :meth:`compute_length_distribution`.
             * ``"error_bound"``      – float, δ_H^G from Corollary 1, or None
-                                       if ``score_matching_residuals`` is None.
+                                       if ``return_stage_errors`` is None.
             * ``"n_trajectories"``   – int, M used.
             * ``"horizon"``          – int, H.
             * ``"gamma"``            – float, γ.
@@ -612,8 +621,8 @@ class OPEEvaluator:
 
         # Optional Corollary 1 bound.
         error_bound: Optional[float] = None
-        if score_matching_residuals is not None:
-            error_bound = self.corollary1_error_bound(score_matching_residuals)
+        if return_stage_errors is not None:
+            error_bound = self.corollary1_error_bound(return_stage_errors)
 
         if verbose:
             logger.info(

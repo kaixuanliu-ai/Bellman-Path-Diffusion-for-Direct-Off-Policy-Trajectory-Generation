@@ -419,9 +419,20 @@ def _merge_config_and_args(
 
     if args.config is not None:
         yaml_cfg = _load_yaml_config(args.config)
-        # For each key in the YAML config, set it on `args` only if the user
-        # did NOT explicitly pass the corresponding CLI flag.
-        defaults = {a.dest: a.default for a in parser._actions}
+        # Determine which flags the user *explicitly* passed by scanning argv
+        # directly.  Comparing against parser defaults is unreliable: a CLI
+        # value that happens to equal the default would be misread as "not
+        # provided" and wrongly overridden by the YAML config.
+        argv_list = list(sys.argv[1:] if argv is None else argv)
+        provided_dests = set()
+        for action in parser._actions:
+            for opt in action.option_strings:
+                if opt in argv_list or any(
+                    token.startswith(opt + "=") for token in argv_list
+                ):
+                    provided_dests.add(action.dest)
+                    break
+
         for key, value in yaml_cfg.items():
             # Environment dimensions are declarations checked after loading;
             # they are inferred from the actual dataset rather than trusted as
@@ -439,9 +450,9 @@ def _merge_config_and_args(
                     "YAML config key '%s' is not a recognised argument; skipping.", key
                 )
                 continue
-            # If the current value equals the parser default, the user did not
-            # pass the flag explicitly, so the YAML value takes precedence.
-            if getattr(args, key) == defaults.get(key):
+            # CLI flags (highest priority) win over YAML; YAML wins over the
+            # argparse default.
+            if key not in provided_dests:
                 setattr(args, key, value)
 
     return args

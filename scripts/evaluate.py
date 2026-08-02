@@ -443,6 +443,7 @@ def _bootstrap_ci(
     per_trajectory_returns: List[float],
     n_bootstrap: int = 2000,
     alpha: float = 0.05,
+    seed: Optional[int] = None,
 ) -> Tuple[float, float]:
     """Compute a two-sided (1-alpha) bootstrap confidence interval for the mean.
 
@@ -450,13 +451,15 @@ def _bootstrap_ci(
         per_trajectory_returns: List of M return values, one per trajectory.
         n_bootstrap:            Number of bootstrap resamples.
         alpha:                  Significance level (default 0.05 → 95% CI).
+        seed:                   Seed for the bootstrap RNG.  Passing the global
+                                run seed makes the reported CI reproducible.
 
     Returns:
         (ci_lo, ci_hi) as Python floats.
     """
     arr = np.array(per_trajectory_returns, dtype=np.float64)
     M = len(arr)
-    rng = np.random.default_rng()
+    rng = np.random.default_rng(seed)
     boot_means = np.empty(n_bootstrap, dtype=np.float64)
     for i in range(n_bootstrap):
         sample = rng.choice(arr, size=M, replace=True)
@@ -605,7 +608,7 @@ def _mc_ground_truth(
     env.close()
 
     arr = np.array(episode_returns, dtype=np.float64)
-    ci_lo, ci_hi = _bootstrap_ci(episode_returns, n_bootstrap=2000)
+    ci_lo, ci_hi = _bootstrap_ci(episode_returns, n_bootstrap=2000, seed=seed)
     return {
         "mc_mean": float(arr.mean()),
         "mc_std": float(arr.std()),
@@ -832,7 +835,7 @@ def main(argv: Optional[List[str]] = None) -> None:
     # ------------------------------------------------------------------
     ope_estimate = float(np.mean(per_traj_returns))
     ci_lo, ci_hi = _bootstrap_ci(
-        per_traj_returns, n_bootstrap=args.n_bootstrap, alpha=0.05
+        per_traj_returns, n_bootstrap=args.n_bootstrap, alpha=0.05, seed=args.seed
     )
 
     print("\n" + "=" * 60)

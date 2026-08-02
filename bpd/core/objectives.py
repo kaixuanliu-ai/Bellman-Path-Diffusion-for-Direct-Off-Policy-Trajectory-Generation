@@ -72,6 +72,7 @@ class BellmanDiffusionLoss(nn.Module):
         token_dim: int,
         loss_weight_fn: Optional[Callable[[Tensor, DDPMSchedule], Tensor]] = None,
         diffusion: Optional[BlockwiseDiffusion] = None,
+        prediction_type: str = "v",
     ) -> None:
         super().__init__()
         if not 0.0 < gamma < 1.0:
@@ -80,7 +81,12 @@ class BellmanDiffusionLoss(nn.Module):
         self.schedule = schedule
         self.token_dim = int(token_dim)
         self.loss_weight_fn = loss_weight_fn
-        self.diffusion = diffusion or BlockwiseDiffusion(schedule, token_dim)
+        # When no diffusion is supplied, build one in the requested
+        # parameterisation (v-prediction by default, for the exact source
+        # boundary).  When one is supplied, its parameterisation governs.
+        self.diffusion = diffusion or BlockwiseDiffusion(
+            schedule, token_dim, prediction_type=prediction_type
+        )
         if self.diffusion.token_dim != token_dim or self.diffusion.T != schedule.T:
             raise ValueError("diffusion is incompatible with schedule/token_dim")
         self.stop_branch = StopBranch(self.diffusion)

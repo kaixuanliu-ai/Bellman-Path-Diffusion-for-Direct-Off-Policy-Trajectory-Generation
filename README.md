@@ -116,7 +116,7 @@ from bpd.data.replay import SuffixReplayBuffer
 
 # Setup
 obs_dim, act_dim = 11, 3
-token_dim = 1 + obs_dim + act_dim  # reward + next_obs + next_action
+token_dim = 2 + obs_dim + act_dim  # reward + next_obs + next_action + injective-phi flag
 gamma = 0.99
 H = 8  # max horizon
 

@@ -25,6 +25,8 @@ References
 from __future__ import annotations
 
 import logging
+import os
+from pathlib import Path
 from typing import Callable, Dict, Optional, Union
 
 import numpy as np
@@ -70,6 +72,15 @@ def load_d4rl_dataset(env_name: str) -> Dict[str, np.ndarray]:
         ImportError: If ``d4rl`` or ``gym`` are not installed.
         RuntimeError: If the dataset returned by D4RL is missing required keys.
     """
+    # Route the D4RL download cache to a local, gitignored directory *before*
+    # importing d4rl (which reads D4RL_DATASET_DIR at import time).  This keeps
+    # datasets under the repo's /local path and never writes to $HOME/.d4rl.
+    if "D4RL_DATASET_DIR" not in os.environ:
+        default_cache = Path(__file__).resolve().parents[2] / "data" / "d4rl"
+        default_cache.mkdir(parents=True, exist_ok=True)
+        os.environ["D4RL_DATASET_DIR"] = str(default_cache)
+    logger.info("D4RL_DATASET_DIR=%s", os.environ["D4RL_DATASET_DIR"])
+
     try:
         import d4rl  # type: ignore[import]  # noqa: F401 – registers envs
         import gym  # type: ignore[import]
@@ -81,7 +92,13 @@ def load_d4rl_dataset(env_name: str) -> Dict[str, np.ndarray]:
         ) from exc
 
     env = gym.make(env_name)
-    raw: Dict[str, np.ndarray] = env.get_dataset()
+    # Prefer d4rl.qlearning_dataset: it constructs ``next_observations`` (which
+    # the raw env.get_dataset() does not always provide) and drops terminal
+    # transitions with ill-defined successors, matching the offline-RL contract.
+    if hasattr(d4rl, "qlearning_dataset"):
+        raw: Dict[str, np.ndarray] = d4rl.qlearning_dataset(env)
+    else:  # pragma: no cover - fallback for nonstandard d4rl builds
+        raw = env.get_dataset()
 
     # Validate required keys
     required = {"observations", "actions", "rewards", "next_observations", "terminals"}

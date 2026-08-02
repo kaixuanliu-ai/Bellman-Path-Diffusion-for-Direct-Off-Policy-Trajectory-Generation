@@ -45,15 +45,23 @@ directory. No reference repository is vendored into this project.
 - The exact recovery theorem assumes realizability, population optimization,
   an exact teacher, and exact reverse integration. The implementation uses a
   finite network, SGD, EMA snapshots, and a finite DDPM solver.
-- Source boundary `alpha_T = 0, sigma_T = 1` (paper.tex L409) is now enforced
+- Source boundary `alpha_T = 0, sigma_T = 1` (paper.tex L409) is enforced
   **exactly**: `DDPMSchedule` applies a zero-terminal-SNR rescaling of
   `sqrt(alphabar_t)` (Lin et al. 2024, "Common Diffusion Noise Schedules and
   Sample Steps are Flawed", Algorithm 1) so the terminal marginal is
   symbolically `N(0,I)`, not merely numerically close. Enabled by default via
-  `zero_terminal_snr=True`. Note: with epsilon-prediction the terminal x0
-  estimate is amplified by `1/alpha_T`; sampling relies on the standard x0
-  handling (a well-trained net predicts eps≈z_T at t=T, cancelling to ≈0), and
-  `clip_denoised` remains available for normalized-token runs.
+  `zero_terminal_snr=True`.
+- **v-prediction is the default parameterization** (`BlockwiseDiffusion(...,
+  prediction_type="v")`), which is what makes the exact `alpha_T = 0` source
+  usable: x0 recovery uses `x0 = alpha_t*z_t - sigma_t*v` (finite at the
+  source, `x0 = -v`), avoiding the singular epsilon recovery `x0 =
+  (z_t - sigma_t*eps)/alpha_t` whose `1/alpha_T` factor amplifies terminal
+  error (Lin et al. 2024 pair rescaling with v-prediction for exactly this
+  reason; Salimans & Ho 2022 for the v-objective). Training targets, the frozen
+  teacher, and the reverse sampler all share the parameterization; `"epsilon"`
+  remains selectable. Both are the same score field up to an affine change of
+  basis, so the Bellman branch composition (stop-gradient teacher suffix, no
+  gamma multiplier) is unchanged.
 - The token map `phi` is now **injective by construction** (paper.tex L384):
   each token carries a trailing flag coordinate, `+1` for a real token and
   `-1` for the padding token `phi(bottom) = (0,...,0,-1)`. Decoding is the
@@ -64,9 +72,26 @@ directory. No reference repository is vendored into this project.
 - Clean-suffix replay is exact only conditional on the same float32 `(s',a')`.
   Rounded or nearest-neighbor replay is disabled by default. A finite cached
   sample reused across updates remains a finite-sample approximation.
+- Data/infra correctness fixes: the D4RL loader now calls
+  `d4rl.qlearning_dataset(env)` (which constructs `next_observations`) and
+  routes downloads to a repo-local, gitignored `data/d4rl` via
+  `D4RL_DATASET_DIR`, never `$HOME/.d4rl`. Checkpoints load with
+  `weights_only=False` (PyTorch >= 2.6) and directory loads prefer `final.pt`
+  (the only checkpoint bundling full config + normalizer). `encode_token` is
+  device-safe for CUDA datasets. The bootstrap CI RNG is seeded from the run
+  seed. The YAML/CLI merge detects explicitly-passed flags from `argv` (a CLI
+  value equal to the argparse default is no longer overridden by YAML).
+  `corollary1_error_bound` now documents its argument as the return-seminorm
+  (G-seminorm) stage error epsilon_h^G (Eq. 66), not a score-matching residual.
 - Coverage of every evaluation-policy state-action pair cannot be established
   from software alone. Training/evaluation must report a coverage diagnostic
   for each dataset-policy pair.
-- The included tests verify equations, shapes, gradients, replay keys, and a
-  two-stage CPU smoke run. They are not benchmark results. A paper claim of
-  empirical OPE accuracy requires full seeded experiments and baselines.
+- Deferred (not yet implemented, do not affect the core recursion): a
+  target-policy checkpoint loader in the CLI (the API already accepts any
+  policy callable), a dedicated absorbing-state flag, an executable coverage
+  diagnostic, and true stage/step training resume. `gym>=0.26` is declared but
+  the rollout code uses the older `reset/step/env.seed` API.
+- The included tests verify equations, shapes, gradients, replay keys, the
+  v-prediction source stability, and a two-stage CPU smoke run. They are not
+  benchmark results. A paper claim of empirical OPE accuracy requires full
+  seeded D4RL experiments, baselines, and multiple seeds.
