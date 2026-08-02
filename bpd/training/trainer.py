@@ -75,6 +75,14 @@ class BellmanPathDiffusionTrainer:
         # GPU throughput knobs (no-ops on CPU).
         self.amp = bool(self.config.get("amp", True))
         self.data_on_device = bool(self.config.get("data_on_device", True))
+        # Replay amortization (Proposition 2): fill the buffer with clean
+        # teacher suffixes for a pool of transitions once per refresh, then draw
+        # training minibatches from that pool so the continuation branch reuses
+        # cached suffixes (corrupt-at-t) instead of regenerating them every
+        # step.  Without this, continuous x' always misses the exact-key buffer
+        # and each step pays a full T-step teacher rollout.  Set False for the
+        # strict per-step fresh-sampling path (population-equivalent but slow).
+        self.amortize_replay = bool(self.config.get("amortize_replay", True))
 
         if self.H < 1 or self.steps_per_horizon < 1 or self.batch_size < 1:
             raise ValueError("H, steps_per_horizon, and batch_size must be positive")
@@ -132,6 +140,7 @@ class BellmanPathDiffusionTrainer:
         teacher_fn = self._teacher_noise_fn(h)
 
         replay: Optional[SuffixReplayBuffer] = None
+        pool: Optional[tuple[Tensor, Tensor]] = None
         if h > 1:
             replay = SuffixReplayBuffer(
                 max_size=self.replay_buffer_size,
@@ -139,7 +148,7 @@ class BellmanPathDiffusionTrainer:
                 token_dim=self.diffusion.token_dim,
             )
             self._replay_buffers[h] = replay
-            self._refresh_replay_buffer(
+            pool = self._refresh_replay_buffer(
                 replay,
                 h,
                 dataset,
@@ -149,12 +158,18 @@ class BellmanPathDiffusionTrainer:
                 self.replay_refresh_size,
             )
 
+        # When amortizing, training draws from the buffered pool so the
+        # continuation branch reuses cached suffixes instead of regenerating.
+        sample_pool = pool if self.amortize_replay else None
+
         running_loss = 0.0
         stage_loss = 0.0
         final_loss = float("nan")
         for local_step in range(1, self.steps_per_horizon + 1):
             self._global_step += 1
-            batch, next_action = self._sample_batch(dataset, eval_policy_fn, device)
+            batch, next_action = self._sample_batch(
+                dataset, eval_policy_fn, device, pool=sample_pool
+            )
             with torch.autocast(device_type=device.type, enabled=self._amp_on):
                 loss = self.objective(
                     self.score_net,
@@ -194,7 +209,7 @@ class BellmanPathDiffusionTrainer:
                 and self.replay_refresh_freq > 0
                 and local_step % self.replay_refresh_freq == 0
             ):
-                self._refresh_replay_buffer(
+                pool = self._refresh_replay_buffer(
                     replay,
                     h,
                     dataset,
@@ -203,6 +218,7 @@ class BellmanPathDiffusionTrainer:
                     device,
                     self.replay_refresh_size,
                 )
+                sample_pool = pool if self.amortize_replay else None
 
         self._freeze_stage(h)
         return {
@@ -216,7 +232,26 @@ class BellmanPathDiffusionTrainer:
         dataset: TransitionDataset,
         eval_policy_fn: Callable[[Tensor], Tensor],
         device: torch.device,
+        pool: Optional[tuple[Tensor, Tensor]] = None,
     ) -> tuple[DataBatch, Tensor]:
+        if pool is not None:
+            # Amortized path: draw from the replay pool so each x' hits the
+            # cached suffix (Proposition 2) instead of triggering a rollout.
+            pool_index, pool_next_action = pool
+            sel = torch.randint(
+                0, pool_index.shape[0], (self.batch_size,), device=pool_index.device
+            )
+            index = pool_index[sel]
+            next_action = pool_next_action[sel].to(device)
+            batch = DataBatch(
+                state=dataset.states[index].to(device, non_blocking=True),
+                action=dataset.actions[index].to(device, non_blocking=True),
+                reward=dataset.rewards[index].to(device, non_blocking=True),
+                next_state=dataset.next_states[index].to(device, non_blocking=True),
+                done=dataset.dones[index].to(device, non_blocking=True),
+            )
+            return batch, next_action
+
         index = torch.randint(
             0, len(dataset), (self.batch_size,), device=dataset.states.device
         )
@@ -253,9 +288,16 @@ class BellmanPathDiffusionTrainer:
         teacher_fn: Optional[TeacherNoiseFn],
         device: torch.device,
         n_samples: int,
-    ) -> None:
+    ) -> Optional[tuple[Tensor, Tensor]]:
+        """Generate clean teacher suffixes for a pool of transitions and cache
+        them, keyed by exactly the (s', a') used to condition the generator.
+
+        Returns the pool as ``(indices, next_actions)`` so that training can
+        draw minibatches from the same transitions (whose x' therefore hit the
+        buffer), which is what amortizes the teacher rollout over many steps.
+        """
         if h <= 1 or n_samples <= 0:
-            return
+            return None
         if teacher_fn is None:
             raise RuntimeError(f"missing frozen teacher for horizon {h - 1}")
         index = torch.randint(
@@ -285,6 +327,10 @@ class BellmanPathDiffusionTrainer:
         for sample_index in range(n_samples):
             # The key and generator condition are exactly the same (s', a').
             replay.add(x_prime[sample_index], suffix[sample_index])
+        # Pool for amortized training reuse: the same indices/actions whose
+        # suffixes are now cached.  next_action is stored so that stochastic
+        # policies still reproduce the exact buffered x' key.
+        return index.to(device), next_action
 
     def _teacher_noise_fn(self, h: int) -> Optional[TeacherNoiseFn]:
         if h == 1:
