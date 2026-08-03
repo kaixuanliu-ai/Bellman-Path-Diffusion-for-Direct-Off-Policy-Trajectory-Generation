@@ -313,6 +313,7 @@ class BlockwiseDiffusion(nn.Module):
         token_dim: int,
         clip_denoised: bool = False,
         prediction_type: str = "v",
+        sample_amp: bool = True,
     ) -> None:
         super().__init__()
         if prediction_type not in ("v", "epsilon"):
@@ -324,6 +325,10 @@ class BlockwiseDiffusion(nn.Module):
         self.T = schedule.T
         self.clip_denoised = bool(clip_denoised)
         self.prediction_type = prediction_type
+        # Run the reverse-chain network evaluations under autocast (CUDA only;
+        # autocast is a no-op elsewhere).  The reverse chain dominates teacher
+        # rollouts and OPE generation, so fp32-only sampling wastes the GPU.
+        self.sample_amp = bool(sample_amp)
 
         # Register all schedule tensors as buffers so they move with .to(device)
         self.register_buffer("alphas_bar", schedule.alphas_bar)
@@ -651,10 +656,16 @@ class BlockwiseDiffusion(nn.Module):
         for t in reversed(range(1, self.T + 1)):
             t_tensor = torch.full((batch_size,), t, dtype=torch.long, device=device)
 
-            with torch.no_grad():
+            # Network evaluation under autocast: the reverse chain is a hot path
+            # (teacher rollouts during training and OPE generation), and running
+            # it in fp32 leaves the GPU tensor cores idle.  The posterior update
+            # itself stays in fp32 for numerical stability.
+            with torch.no_grad(), torch.autocast(
+                device_type=torch.device(device).type, enabled=self.sample_amp
+            ):
                 noise_pred = score_net(z, x, t_tensor)
 
-            z = self.p_sample_step(noise_pred, z, t, x)
+            z = self.p_sample_step(noise_pred.float(), z, t, x)
 
         return z
 
@@ -703,10 +714,12 @@ class BlockwiseDiffusion(nn.Module):
         for t in reversed(range(t_stop + 1, self.T + 1)):
             t_tensor = torch.full((batch_size,), t, dtype=torch.long, device=device)
 
-            with torch.no_grad():
+            with torch.no_grad(), torch.autocast(
+                device_type=torch.device(device).type, enabled=self.sample_amp
+            ):
                 noise_pred = score_net(z, x, t_tensor)
 
-            z = self.p_sample_step(noise_pred, z, t, x)
+            z = self.p_sample_step(noise_pred.float(), z, t, x)
 
         return z
 

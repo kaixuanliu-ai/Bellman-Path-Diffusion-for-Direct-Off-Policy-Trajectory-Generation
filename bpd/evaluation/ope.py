@@ -268,14 +268,23 @@ class OPEEvaluator:
                 device=device,
             )  # (M, H, token_dim)
 
-        # ---- Step 6: decode each trajectory and remove padding ---
-        trajectories: List[Tensor] = []
-        for m in range(n_trajectories):
-            tokens, is_real = self.decode_trajectory(z0[m], h=self.H)
-            # Retain only the leading real tokens (stop at first padding).
-            real_count = int(is_real.sum().item())
-            trajectories.append(tokens[:real_count])  # (L_m, token_dim)
+        # ---- Step 6: decode and remove padding (batched) ---
+        # Vectorized equivalent of decode_trajectory over the whole batch: a
+        # per-trajectory Python loop would force one GPU sync per sample
+        # (thousands of stalls at typical M).  Here the flag test, the
+        # prefix-real invariant and the lengths are computed in a few batched
+        # ops, so only a single host transfer is needed.
+        is_padding = z0[..., -1] < PAD_THRESHOLD          # (M, H)
+        is_real = ~is_padding
+        if self.H > 0:
+            is_real[:, 0] = True                          # Eq. 6: slot 0 is real
+            # Enforce prefix-real / suffix-padding (Eq. 4-5).
+            is_real = torch.cumprod(is_real.to(torch.long), dim=1).bool()
+        lengths = is_real.sum(dim=1).tolist()             # single sync
 
+        trajectories: List[Tensor] = [
+            z0[m, : lengths[m]] for m in range(n_trajectories)
+        ]
         return trajectories
 
     # -----------------------------------------------------------------------

@@ -328,9 +328,14 @@ class BellmanPathDiffusionTrainer:
             batch_size=n_samples,
             device=device,
         )
+        # Move the whole batch to host in ONE transfer before inserting: the
+        # buffer stores CPU copies, so a per-item add() would issue n_samples
+        # separate device->host copies (a GPU stall each) during every refresh.
+        x_prime_cpu = x_prime.detach().to("cpu", non_blocking=False)
+        suffix_cpu = suffix.detach().to("cpu", non_blocking=False)
         for sample_index in range(n_samples):
             # The key and generator condition are exactly the same (s', a').
-            replay.add(x_prime[sample_index], suffix[sample_index])
+            replay.add(x_prime_cpu[sample_index], suffix_cpu[sample_index])
         # Pool for amortized training reuse: the transitions whose clean
         # suffixes are now cached.  The suffix tensor is returned so training
         # can hand it directly to the objective (fast path, no per-item buffer
