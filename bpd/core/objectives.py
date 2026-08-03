@@ -73,11 +73,30 @@ class BellmanDiffusionLoss(nn.Module):
         loss_weight_fn: Optional[Callable[[Tensor, DDPMSchedule], Tensor]] = None,
         diffusion: Optional[BlockwiseDiffusion] = None,
         prediction_type: str = "v",
+        branch_sample_p: Optional[float] = None,
     ) -> None:
         super().__init__()
         if not 0.0 < gamma < 1.0:
             raise ValueError(f"gamma must lie in (0, 1), got {gamma}")
         self.gamma = float(gamma)
+        # Branch sampling probability.  By default the continuation branch is
+        # drawn with probability gamma, which is the natural estimator of
+        # Eq. 48 -- but at gamma close to 1 only a (1-gamma) fraction of each
+        # batch lands on the stopping branch, and that branch carries the ONLY
+        # signal for the padding structure (hence the geometric length law of
+        # Eq. 14).  Setting branch_sample_p < gamma oversamples the stopping
+        # branch and reweights by (1-gamma)/(1-p) and gamma/p, which leaves the
+        # population objective unchanged (importance sampling) while giving the
+        # length law many more effective samples per step.
+        if branch_sample_p is None:
+            branch_sample_p = self.gamma
+        if not 0.0 < branch_sample_p < 1.0:
+            raise ValueError(
+                f"branch_sample_p must lie in (0, 1), got {branch_sample_p}"
+            )
+        self.branch_sample_p = float(branch_sample_p)
+        self._w_stop = (1.0 - self.gamma) / (1.0 - self.branch_sample_p)
+        self._w_cont = self.gamma / self.branch_sample_p
         self.schedule = schedule
         self.token_dim = int(token_dim)
         self.loss_weight_fn = loss_weight_fn
@@ -129,7 +148,15 @@ class BellmanDiffusionLoss(nn.Module):
             weights = self.loss_weight_fn(targets.timesteps, self.schedule).to(
                 device=per_example.device, dtype=per_example.dtype
             )
-        return (weights * per_example).mean()
+        # Importance weights restoring the Eq. 48 mixture when the branch is
+        # drawn with probability branch_sample_p != gamma.  When they are equal
+        # both weights are 1 and this is the identity.
+        branch_w = torch.where(
+            targets.continuation,
+            torch.full_like(per_example, self._w_cont),
+            torch.full_like(per_example, self._w_stop),
+        )
+        return (weights * branch_w * per_example).mean()
 
     def build_targets(
         self,
@@ -185,7 +212,9 @@ class BellmanDiffusionLoss(nn.Module):
         else:
             timesteps = timesteps.to(device=state.device, dtype=torch.long)
         if continuation is None:
-            continuation = torch.rand(batch_size, device=state.device) < self.gamma
+            continuation = (
+                torch.rand(batch_size, device=state.device) < self.branch_sample_p
+            )
         else:
             continuation = continuation.to(device=state.device, dtype=torch.bool)
         if h == 1:

@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 from typing import Optional
 
 import torch
@@ -86,6 +87,102 @@ def configure_performance(
         )
     else:
         logger.info("perf: device=cpu, cpu_threads=%d", threads)
+
+
+def maybe_compile(module, enabled: bool = True, dynamic: bool = True):
+    """Optionally wrap *module* with ``torch.compile``.
+
+    The BPD score network is a stack of small GEMMs (model_dim is typically a
+    few hundred), so a large share of step time is kernel-launch overhead rather
+    than math.  ``torch.compile`` fuses those ops and typically recovers a solid
+    fraction of it.
+
+    ``dynamic=True`` matters here: the horizon ``h`` changes the sequence
+    length, and a static compile would trigger a fresh recompilation for every
+    horizon (H recompiles, often costing more than it saves).
+
+    Falls back to the eager module if compilation is unavailable or fails, so
+    enabling this can never break a run.
+
+    Args:
+        module:  The ``nn.Module`` to compile.
+        enabled: Set False to keep the eager module.
+        dynamic: Compile with dynamic shapes (recommended for variable h).
+
+    Returns:
+        The compiled module, or the original on failure / when disabled.
+    """
+    if not enabled or not hasattr(torch, "compile"):
+        return module
+    try:
+        compiled = torch.compile(module, dynamic=dynamic)
+        logger.info("perf: torch.compile enabled (dynamic=%s)", dynamic)
+        return compiled
+    except Exception as exc:  # pragma: no cover - backend/toolchain dependent
+        logger.warning("perf: torch.compile unavailable (%s); using eager", exc)
+        return module
+
+
+class ThroughputMeter:
+    """Track training throughput: samples/s, tokens/s and effective TFLOPS.
+
+    Utilization percentages from ``nvidia-smi`` only report that *some* kernel
+    was resident; they stay near 100% even when the GPU is starved by tiny
+    launches or is waiting on the host.  Throughput is the metric that actually
+    exposes those stalls, so the trainer reports it directly.
+
+    Args:
+        n_params:    Trainable parameter count of the network (for the
+                     6*N*tokens forward+backward FLOP estimate).
+        device:      Compute device (used to synchronize before timing).
+        window:      Number of steps averaged per report.
+    """
+
+    def __init__(self, n_params: int, device: torch.device, window: int = 100):
+        self.n_params = int(n_params)
+        self.device = torch.device(device)
+        self.window = max(1, int(window))
+        self._samples = 0
+        self._tokens = 0
+        self._steps = 0
+        self._t0 = time.perf_counter()
+
+    def update(self, batch_size: int, seq_len: int) -> Optional[dict]:
+        """Record one step; returns a stats dict once per window, else None."""
+        self._samples += int(batch_size)
+        self._tokens += int(batch_size) * int(seq_len)
+        self._steps += 1
+        if self._steps < self.window:
+            return None
+        if self.device.type == "cuda":
+            torch.cuda.synchronize(self.device)
+        dt = max(1e-9, time.perf_counter() - self._t0)
+        stats = {
+            "samples_per_s": self._samples / dt,
+            "tokens_per_s": self._tokens / dt,
+            "tflops": 6.0 * self.n_params * self._tokens / dt / 1e12,
+            "ms_per_step": 1000.0 * dt / self._steps,
+        }
+        if self.device.type == "cuda":
+            stats["vram_gb"] = torch.cuda.max_memory_allocated(self.device) / 1e9
+            total = torch.cuda.get_device_properties(self.device).total_memory
+            stats["vram_pct"] = 100.0 * torch.cuda.max_memory_allocated(self.device) / total
+        self._samples = self._tokens = self._steps = 0
+        self._t0 = time.perf_counter()
+        return stats
+
+
+def format_throughput(stats: dict) -> str:
+    """Render :class:`ThroughputMeter` stats as a compact log line."""
+    parts = [
+        f"{stats['samples_per_s']:,.0f} samples/s",
+        f"{stats['tokens_per_s']/1e3:,.0f}k tokens/s",
+        f"{stats['tflops']:.1f} TFLOPS",
+        f"{stats['ms_per_step']:.1f} ms/step",
+    ]
+    if "vram_gb" in stats:
+        parts.append(f"VRAM {stats['vram_gb']:.1f}GB ({stats['vram_pct']:.0f}%)")
+    return "  ".join(parts)
 
 
 def amp_enabled(device: torch.device, requested: bool) -> bool:

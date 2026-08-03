@@ -29,7 +29,7 @@ from bpd.data.replay import SuffixReplayBuffer
 from bpd.models.diffusion import BlockwiseDiffusion
 from bpd.training.ema import EMA
 from bpd.utils.arrays import DataBatch
-from bpd.utils.perf import amp_enabled
+from bpd.utils.perf import ThroughputMeter, amp_enabled, format_throughput
 
 logger = logging.getLogger(__name__)
 
@@ -83,6 +83,14 @@ class BellmanPathDiffusionTrainer:
         # and each step pays a full T-step teacher rollout.  Set False for the
         # strict per-step fresh-sampling path (population-equivalent but slow).
         self.amortize_replay = bool(self.config.get("amortize_replay", True))
+        # Early stopping: short horizons converge long before
+        # steps_per_horizon, so a fixed budget wastes most of the small-h
+        # stages.  Stop a stage once its running loss stops improving.
+        # plateau_patience=0 disables it (fixed budget, the strict default).
+        self.plateau_patience = int(self.config.get("plateau_patience", 0))
+        self.plateau_window = int(self.config.get("plateau_window", 100))
+        self.plateau_min_steps = int(self.config.get("plateau_min_steps", 300))
+        self.plateau_rel_tol = float(self.config.get("plateau_rel_tol", 0.01))
 
         if self.H < 1 or self.steps_per_horizon < 1 or self.batch_size < 1:
             raise ValueError("H, steps_per_horizon, and batch_size must be positive")
@@ -162,9 +170,21 @@ class BellmanPathDiffusionTrainer:
         # continuation branch reuses cached suffixes instead of regenerating.
         sample_pool = pool if self.amortize_replay else None
 
-        running_loss = 0.0
-        stage_loss = 0.0
-        final_loss = float("nan")
+        # Loss bookkeeping is accumulated ON DEVICE: calling .item() every step
+        # forces a host sync per step, which stalls the pipeline (noticeable at
+        # short horizons where a step is only tens of milliseconds).  We sync
+        # once per logging window instead.
+        running_loss_t = torch.zeros((), device=device)
+        stage_loss_t = torch.zeros((), device=device)
+        last_loss_t = torch.zeros((), device=device)
+        steps_done = 0
+        best_window = float("inf")
+        stale_windows = 0
+        meter = ThroughputMeter(
+            sum(p.numel() for p in self.score_net.parameters()),
+            device,
+            window=self.log_freq,
+        )
         for local_step in range(1, self.steps_per_horizon + 1):
             self._global_step += 1
             batch, next_action, cached_suffix = self._sample_batch(
@@ -192,15 +212,46 @@ class BellmanPathDiffusionTrainer:
             self._scaler.update()
             self.ema.update(self.score_net, step=self._global_step)
 
-            final_loss = float(loss.detach().item())
-            stage_loss += final_loss
-            running_loss += final_loss
+            detached = loss.detach()
+            last_loss_t = detached
+            stage_loss_t += detached
+            running_loss_t += detached
+            steps_done = local_step
+            tp = meter.update(self.batch_size, h)
             if local_step % self.log_freq == 0:
-                mean = running_loss / self.log_freq
-                logger.info("h=%d step=%d loss=%.6f", h, self._global_step, mean)
+                mean = float(running_loss_t.item()) / self.log_freq  # one sync
+                logger.info(
+                    "h=%d step=%d loss=%.6f | %s",
+                    h, self._global_step, mean,
+                    format_throughput(tp) if tp else "",
+                )
                 if writer is not None:
                     writer.add_scalar(f"train/loss_h{h}", mean, self._global_step)
-                running_loss = 0.0
+                    if tp:
+                        writer.add_scalar(
+                            "perf/samples_per_s", tp["samples_per_s"], self._global_step
+                        )
+                        writer.add_scalar("perf/tflops", tp["tflops"], self._global_step)
+                running_loss_t = torch.zeros((), device=device)
+
+            # Plateau early stopping (opt-in via plateau_patience > 0).
+            if (
+                self.plateau_patience > 0
+                and local_step >= self.plateau_min_steps
+                and local_step % self.plateau_window == 0
+            ):
+                window_mean = float(stage_loss_t.item()) / local_step
+                if window_mean < best_window * (1.0 - self.plateau_rel_tol):
+                    best_window = window_mean
+                    stale_windows = 0
+                else:
+                    stale_windows += 1
+                    if stale_windows >= self.plateau_patience:
+                        logger.info(
+                            "h=%d early stop at step %d (plateau, mean=%.6f)",
+                            h, local_step, window_mean,
+                        )
+                        break
 
             if self.save_freq > 0 and local_step % self.save_freq == 0:
                 self.save(self._checkpoint_path(h, self._global_step), h)
@@ -222,10 +273,145 @@ class BellmanPathDiffusionTrainer:
                 sample_pool = pool if self.amortize_replay else None
 
         self._freeze_stage(h)
+        steps_done = max(1, steps_done)
         return {
-            "final_loss": final_loss,
-            "mean_loss": stage_loss / self.steps_per_horizon,
-            "steps": float(self.steps_per_horizon),
+            "final_loss": float(last_loss_t.item()),
+            "mean_loss": float(stage_loss_t.item()) / steps_done,
+            "steps": float(steps_done),
+        }
+
+    def train_curriculum(
+        self,
+        dataset: TransitionDataset,
+        eval_policy_fn: Callable[[Tensor], Tensor],
+        device: torch.device,
+        total_steps: int,
+        block_steps: int = 100,
+        writer: Optional[SummaryWriter] = None,
+    ) -> Dict[str, float]:
+        """Appendix D variant: one shared network, EMA teacher, horizon curriculum.
+
+        ``train_all_stages`` implements the strict stagewise recursion of
+        Theorem 3: horizon h is only trained after h-1 has finished, so the cost
+        scales with H separate stages.  Appendix D describes the practical
+        alternative used here -- a single network trained against its own EMA
+        target, with the horizon drawn from a curriculum p(h) that starts on
+        short horizons and widens toward H.  This collapses the H sequential
+        stages into one run at a fraction of the cost, at the price of replacing
+        exact stage boundaries by a two-timescale approximation.
+
+        Horizons are held fixed for ``block_steps`` updates at a time so the
+        amortized suffix pool (Proposition 2) can be reused within a block
+        instead of being regenerated every step.
+
+        Args:
+            dataset:        Offline transitions.
+            eval_policy_fn: Evaluation policy, normalized space.
+            device:         Compute device.
+            total_steps:    Total gradient steps across all horizons.
+            block_steps:    Updates per sampled horizon (pool reuse window).
+            writer:         Optional TensorBoard writer.
+
+        Returns:
+            Dict with ``mean_loss``, ``final_loss`` and ``steps``.
+        """
+        device = torch.device(device)
+        self.score_net.to(device).train()
+        self.diffusion.to(device)
+        self.ema.get_model().to(device)
+        if self.data_on_device and dataset.states.device != device:
+            dataset.to(device)
+        self._amp_on = amp_enabled(device, self.amp)
+        if self._scaler is None:
+            self._scaler = torch.amp.GradScaler(device.type, enabled=self._amp_on)
+
+        ema_model = self.ema.get_model()
+
+        def ema_teacher(z_t: Tensor, t: Tensor, x: Tensor, h_sub: int) -> Tensor:
+            with torch.no_grad():
+                return ema_model(z_t, t, x, h_sub)
+
+        replays: Dict[int, SuffixReplayBuffer] = {}
+        stage_loss_t = torch.zeros((), device=device)
+        last_loss_t = torch.zeros((), device=device)
+        running_t = torch.zeros((), device=device)
+        meter = ThroughputMeter(
+            sum(p.numel() for p in self.score_net.parameters()),
+            device,
+            window=self.log_freq,
+        )
+        step = 0
+        while step < total_steps:
+            # Curriculum: widen the horizon support as training progresses.
+            progress = step / max(1, total_steps)
+            h_max = 1 + int(progress * (self.H - 1))
+            h = int(torch.randint(1, h_max + 1, (1,)).item())
+
+            pool = None
+            if h > 1:
+                replay = replays.get(h)
+                if replay is None:
+                    replay = SuffixReplayBuffer(
+                        max_size=self.replay_buffer_size,
+                        suffix_horizon=h - 1,
+                        token_dim=self.diffusion.token_dim,
+                    )
+                    replays[h] = replay
+                pool = self._refresh_replay_buffer(
+                    replay, h, dataset, eval_policy_fn, ema_teacher, device,
+                    self.replay_refresh_size,
+                )
+            sample_pool = pool if self.amortize_replay else None
+            teacher_fn = ema_teacher if h > 1 else None
+
+            for _ in range(min(block_steps, total_steps - step)):
+                step += 1
+                self._global_step += 1
+                batch, next_action, cached_suffix = self._sample_batch(
+                    dataset, eval_policy_fn, device, pool=sample_pool
+                )
+                with torch.autocast(device_type=device.type, enabled=self._amp_on):
+                    loss = self.objective(
+                        self.score_net, teacher_fn, batch, h,
+                        next_action=next_action,
+                        replay_buffer=replays.get(h),
+                        cached_suffix=cached_suffix,
+                    )
+                self.optimizer.zero_grad(set_to_none=True)
+                self._scaler.scale(loss).backward()
+                if self.grad_clip_norm > 0:
+                    self._scaler.unscale_(self.optimizer)
+                    nn.utils.clip_grad_norm_(
+                        self.score_net.parameters(), self.grad_clip_norm
+                    )
+                self._scaler.step(self.optimizer)
+                self._scaler.update()
+                self.ema.update(self.score_net, step=self._global_step)
+
+                detached = loss.detach()
+                last_loss_t = detached
+                stage_loss_t += detached
+                running_t += detached
+                tp = meter.update(self.batch_size, h)
+                if step % self.log_freq == 0:
+                    mean = float(running_t.item()) / self.log_freq
+                    logger.info(
+                        "curriculum step=%d/%d h=%d loss=%.6f | %s",
+                        step, total_steps, h, mean,
+                        format_throughput(tp) if tp else "",
+                    )
+                    if writer is not None:
+                        writer.add_scalar("train/loss_curriculum", mean, step)
+                    running_t = torch.zeros((), device=device)
+
+        # The EMA network is the trained artifact; expose it as every teacher so
+        # downstream code that expects stagewise teachers keeps working.
+        for h in range(1, self.H + 1):
+            self._freeze_stage(h)
+        return {
+            "final_loss": float(last_loss_t.item()),
+            "mean_loss": float(stage_loss_t.item()) / max(1, step),
+            "steps": float(step),
         }
 
     def _sample_batch(

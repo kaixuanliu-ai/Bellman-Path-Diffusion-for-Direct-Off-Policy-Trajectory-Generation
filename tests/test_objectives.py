@@ -259,3 +259,71 @@ def test_unknown_loss_weight_raises() -> None:
         get_loss_weight(
             torch.tensor([1]), DDPMSchedule.make_cosine(2), mode="not-a-mode"
         )
+
+
+def test_branch_importance_sampling_is_unbiased() -> None:
+    """Oversampling the stop branch must not change the population objective.
+
+    Eq. 48 weights the branches by (1-gamma) and gamma.  Drawing the branch with
+    probability p != gamma and reweighting by (1-gamma)/(1-p) and gamma/p is an
+    importance-sampling estimator of the SAME quantity, so the expected loss
+    must match the natural (p = gamma) estimator.
+    """
+    gamma, steps, h = 0.9, 4, 3
+    batch = make_batch(512)
+    next_action = torch.randn(512, ACT_DIM)
+
+    class Const(nn.Module):
+        def forward(self, z_t, t, x, hh):
+            return torch.zeros_like(z_t)
+
+    student = Const()
+
+    def zero_teacher_fn(z_t, t, x, hh):
+        return torch.zeros_like(z_t)
+
+    def mean_loss(p, seed):
+        obj = BellmanDiffusionLoss(
+            gamma=gamma,
+            schedule=DDPMSchedule.make_cosine(steps),
+            token_dim=TOKEN_DIM,
+            branch_sample_p=p,
+        )
+        torch.manual_seed(seed)
+        vals = [
+            float(obj(student, zero_teacher_fn, batch, h, next_action=next_action))
+            for _ in range(40)
+        ]
+        return sum(vals) / len(vals)
+
+    natural = mean_loss(gamma, 0)          # p = gamma (default estimator)
+    oversampled = mean_loss(0.5, 0)        # heavy stop-branch oversampling
+
+    # Both estimate the same population objective; allow Monte-Carlo slack.
+    assert abs(natural - oversampled) / natural < 0.15, (
+        f"IS estimator biased: natural={natural:.4f} oversampled={oversampled:.4f}"
+    )
+
+
+def test_branch_importance_weights_reduce_to_identity_at_p_equals_gamma() -> None:
+    obj = BellmanDiffusionLoss(
+        gamma=0.9, schedule=DDPMSchedule.make_cosine(4), token_dim=TOKEN_DIM
+    )
+    assert obj.branch_sample_p == pytest.approx(0.9)
+    assert obj._w_stop == pytest.approx(1.0)
+    assert obj._w_cont == pytest.approx(1.0)
+
+
+def test_branch_sample_p_oversamples_stop_branch() -> None:
+    obj = BellmanDiffusionLoss(
+        gamma=0.95, schedule=DDPMSchedule.make_cosine(4), token_dim=TOKEN_DIM,
+        branch_sample_p=0.5,
+    )
+    batch = make_batch(4000)
+    torch.manual_seed(0)
+    t = obj.build_targets(
+        zero_teacher, batch, 3, next_action=torch.zeros(4000, ACT_DIM)
+    )
+    frac_cont = float(t.continuation.float().mean())
+    # ~50% continuation instead of the natural 95%.
+    assert 0.45 < frac_cont < 0.55
